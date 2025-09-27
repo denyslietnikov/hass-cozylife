@@ -33,7 +33,7 @@ from homeassistant.components.light import (
 )
 from homeassistant.const import CONF_EFFECT
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.const import UnitOfTemperature, CONF_EFFECT
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from typing import Any, Final, Literal, TypedDict, final
