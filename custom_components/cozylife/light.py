@@ -1,6 +1,5 @@
 """Platform for sensor integration."""
 from __future__ import annotations
-from homeassistant.components import zeroconf
 import logging
 from .tcp_client import tcp_client
 from datetime import timedelta
@@ -13,41 +12,26 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP,
     ATTR_EFFECT,
-    ATTR_FLASH,
     ATTR_HS_COLOR,
-    ATTR_KELVIN,
-    ATTR_RGB_COLOR,
     ATTR_TRANSITION,
     COLOR_MODE_BRIGHTNESS,
     COLOR_MODE_COLOR_TEMP,
     COLOR_MODE_HS,
     COLOR_MODE_ONOFF,
-    COLOR_MODE_RGB,
-    COLOR_MODE_UNKNOWN,
-    FLASH_LONG,
-    FLASH_SHORT,
     SUPPORT_EFFECT,
-    SUPPORT_FLASH,
     SUPPORT_TRANSITION,
+    SUPPORT_BRIGHTNESS,
+    SUPPORT_COLOR,
+    SUPPORT_COLOR_TEMP,
     LightEntity,
 )
 from homeassistant.const import CONF_EFFECT
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.const import UnitOfTemperature, CONF_EFFECT
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from typing import Any, Final, Literal, TypedDict, final
+from typing import Any
 from .const import (
-    DOMAIN,
-    SWITCH_TYPE_CODE,
-    LIGHT_TYPE_CODE,
-    LIGHT_DPID,
-    SWITCH,
-    WORK_MODE,
-    TEMP,
-    BRIGHT,
-    HUE,
-    SAT,
+    DOMAIN
 )
 
 from homeassistant.helpers.event import async_track_time_interval
@@ -62,56 +46,61 @@ LIGHT_SCHEMA = vol.Schema({
     vol.Required('did'): cv.string,
     vol.Optional('dmn', default='Smart Bulb Light'): cv.string,
     vol.Optional('pid', default='p93sfg'): cv.string,
-    vol.Optional('dpid', default=[1, 2, 3, 4, 5, 7, 8, 9, 13, 14]):
-        vol.All(cv.ensure_list, [int])
+    vol.Optional('dpid', default=[
+        1, 2, 3, 4, 5, 7, 8, 9, 13, 14
+    ]): vol.All(cv.ensure_list, [int])
 })
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Optional('lights', default=[]):
-        vol.All(cv.ensure_list, [LIGHT_SCHEMA])
+    vol.Optional('lights', default=[]): vol.All(cv.ensure_list, [LIGHT_SCHEMA])
 })
 
 
 SCAN_INTERVAL = timedelta(seconds=60)
 SWITCH_SCAN_INTERVAL = timedelta(seconds=20)
-MIN_INTERVAL=0.2
+MIN_INTERVAL = 0.2
 
 CIRCADIAN_BRIGHTNESS = True
 try:
-  import custom_components.circadian_lighting as cir
-  DATA_CIRCADIAN_LIGHTING=cir.DOMAIN #'circadian_lighting'
-except:
-  CIRCADIAN_BRIGHTNESS = False
+    import custom_components.circadian_lighting as cir
+    DATA_CIRCADIAN_LIGHTING = cir.DOMAIN  # 'circadian_lighting'
+except Exception:
+    CIRCADIAN_BRIGHTNESS = False
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.info(__name__)
 
 SERVICE_SET_EFFECT = "set_effect"
 SERVICE_SET_ALL_EFFECT = "set_all_effect"
-scenes = ['manual','natural','sleep','warm','study','chrismas']
+scenes = [
+    'manual', 'natural', 'sleep', 'warm', 'study', 'chrismas']
 SERVICE_SCHEMA_SET_ALL_EFFECT = {
-vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in scenes])
+    vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in scenes])
 }
 SERVICE_SCHEMA_SET_EFFECT = {
-vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in scenes])
+    vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in scenes])
 }
 
+
 async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_devices: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_devices,
+        discovery_info: DiscoveryInfoType | None = None
 ) -> None:
     """Set up the sensor platform."""
     # We only want this platform to be set up via discovery.
     _LOGGER.info(
-        f'setup_platform.hass={hass},config={config},async_add_entities={async_add_devices},discovery_info={discovery_info}')
+        'setup_platform.hass=%s, config=%s, '
+        'async_add_entities=%s, discovery_info=%s',
+        hass, config, async_add_devices, discovery_info
+    )
     # zc = await zeroconf.async_get_instance(hass)
     # _LOGGER.info(f'zc={zc}')
-    #_LOGGER.info(f'hass.data={hass.data[DOMAIN]}')
-    #_LOGGER.info(f'discovery_info={discovery_info}')
-    #if discovery_info is None:
-    #    return
+    # _LOGGER.info(f'hass.data={hass.data[DOMAIN]}')
+    # _LOGGER.info(f'discovery_info={discovery_info}')
+    # if discovery_info is None:
+    #     return
 
     lights = []
     # treat switch as light in home assistant
@@ -123,180 +112,184 @@ async def async_setup_platform(
         client._dpid = item.get('dpid')
         client._device_model_name = item.get('dmn')
         if 'switch' not in client._device_model_name.lower():
-          lights.append(CozyLifeLight(client, hass, scenes))
+            lights.append(CozyLifeLight(client, hass, scenes))
         else:
-          switches.append(CozyLifeSwitchAsLight(client, hass))
+            switches.append(CozyLifeSwitchAsLight(client, hass))
 
     async_add_devices(lights)
     for light in lights:
         await hass.async_add_executor_job(light._tcp_client._initSocket)
         await asyncio.sleep(0.01)
 
-    async def async_update(now=None):
+    async def async_update_lights(now=None):
         for light in lights:
-            if light._attr_is_on and light._effect ==  'natural':
-              await light.async_turn_on(effect='natural')
+            if light._attr_is_on and light._effect == 'natural':
+                await light.async_turn_on(effect='natural')
             else:
-              await hass.async_add_executor_job(light._refresh_state)
+                await hass.async_add_executor_job(light._refresh_state)
             await asyncio.sleep(0.1)
-    async_track_time_interval(hass, async_update, SCAN_INTERVAL)
+    async_track_time_interval(hass, async_update_lights, SCAN_INTERVAL)
 
     async_add_devices(switches)
     for light in switches:
-        await hass.async_add_executor_job(light._tcp_client._initSocket)
+        await hass.async_add_executor_job(
+            light._tcp_client._initSocket)
         await asyncio.sleep(0.01)
 
-    async def async_update(now=None):
+    async def async_update_switches(now=None):
         for light in switches:
             await hass.async_add_executor_job(light._refresh_state)
             await asyncio.sleep(0.1)
-    async_track_time_interval(hass, async_update, SWITCH_SCAN_INTERVAL)
+    async_track_time_interval(
+        hass, async_update_switches, SWITCH_SCAN_INTERVAL)
 
     platform = entity_platform.async_get_current_platform()
-
     platform.async_register_entity_service(
         SERVICE_SET_EFFECT, SERVICE_SCHEMA_SET_EFFECT, "async_set_effect"
     )
-    async def async_set_all_effect(call:ServiceCall):
+
+    async def async_set_all_effect(call: ServiceCall):
         for light in lights:
             await light.async_set_effect(call.data.get(ATTR_EFFECT))
             await asyncio.sleep(0.01)
-    hass.services.async_register(DOMAIN, SERVICE_SET_ALL_EFFECT, async_set_all_effect)
-
-
-
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_ALL_EFFECT, async_set_all_effect
+    )
 
 
 class CozyLifeSwitchAsLight(LightEntity):
 
     _tcp_client = None
     _attr_is_on = True
-    _unrecorded_attributes = frozenset({"brightness","color_temp"})
+    _unrecorded_attributes = frozenset({"brightness", "color_temp"})
+
     def __init__(self, tcp_client: tcp_client, hass) -> None:
         """Initialize the sensor."""
-        _LOGGER.info('__init__')
+        _LOGGER.info("__init__")
         self.hass = hass
         self._tcp_client = tcp_client
         self._unique_id = tcp_client.device_id
         self._name = tcp_client.device_id[-4:]
-        #self._refresh_state()
 
     @property
     def unique_id(self) -> str | None:
         """Return a unique ID."""
         return self._unique_id
-    
+
     async def async_update(self):
         await self.hass.async_add_executor_job(self._refresh_state)
 
     def _refresh_state(self):
         self._state = self._tcp_client.query()
-        _LOGGER.info(f'_name={self._name},_state={self._state}')
+        _LOGGER.info(f"_name={self._name}, _state={self._state}")
         if self._state:
-            self._attr_is_on = 0 < self._state['1']
-    
+            self._attr_is_on = self._state.get('1', 0) > 0
+
     @property
     def name(self) -> str:
-        return 'cozylife:' + self._name
-    
+        return f"cozylife:{self._name}"
+
     @property
     def available(self) -> bool:
         """Return if the device is available."""
-        if self._tcp_client._connect:
-            return True
-        else:
-            return False
-    
+        return bool(self._tcp_client._connect)
+
     @property
     def is_on(self) -> bool:
         """Return True if entity is on."""
         return self._attr_is_on
-    
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
         self._attr_is_on = True
-
-        _LOGGER.info(f'turn_on:{kwargs}')
-
-        await self.hass.async_add_executor_job(self._tcp_client.control, {
-            '1': 1
-        })
-
+        _LOGGER.info(f"turn_on: {kwargs}")
+        await self.hass.async_add_executor_job(
+            self._tcp_client.control, {'1': 1}
+        )
         return None
-    
+
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
         self._attr_is_on = False
-
-        _LOGGER.info('turn_off')
-
-        await self.hass.async_add_executor_job(self._tcp_client.control, {
-            '1': 0
-        })
-        
+        _LOGGER.info("turn_off")
+        await self.hass.async_add_executor_job(
+            self._tcp_client.control, {'1': 0}
+        )
         return None
 
 
-class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
+class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     _attr_brightness: int | None = None
     _attr_color_mode: str | None = None
     _attr_color_temp: int | None = None
     _attr_hs_color = None
-    _unrecorded_attributes = frozenset({"brightness","color_temp"})
+    _unrecorded_attributes = frozenset({"brightness", "color_temp"})
 
     _tcp_client = None
 
-    _attr_supported_color_modes = {
-        COLOR_MODE_ONOFF}
-    _attr_color_mode = COLOR_MODE_BRIGHTNESS
+    # supported_color_modes is now determined dynamically by dpid
+    _attr_supported_color_modes = None
+    _attr_color_mode = None
 
     def __init__(self, tcp_client: tcp_client, hass, scenes) -> None:
         """Initialize the sensor."""
-        _LOGGER.info('__init__')
+        _LOGGER.info("__init__")
         self.hass = hass
         self._tcp_client = tcp_client
         self._unique_id = tcp_client.device_id
         self._scenes = scenes
         self._effect = 'manual'
-        #self._lasteffect = 'manual'
-
-        #circardianlighting initialize
         self._cl = None
         self._max_brightness = 255
         self._min_brightness = 1
-        #self._name = tcp_client._device_model_name
-        _LOGGER.info(f'before:{self._unique_id}._attr_color_mode={self._attr_color_mode}._attr_supported_color_modes='
-                     f'{self._attr_supported_color_modes}.dpid={tcp_client.dpid}')
         self._name = tcp_client.device_id[-4:]
         self._min_mireds = colorutil.color_temperature_kelvin_to_mired(6500)
         self._max_mireds = colorutil.color_temperature_kelvin_to_mired(2700)
-        self._miredsratio = (self._max_mireds - self._min_mireds)/1000
+        self._miredsratio = (self._max_mireds - self._min_mireds) / 1000
         self._attr_color_temp = 153
         self._attr_hs_color = (0, 0)
         self._transitioning = 0
         self._attr_is_on = False
         self._attr_brightness = 0
 
-        # h s
-        if not 'switch' in self._tcp_client._device_model_name.lower():
+        # Automatically determine supported color modes by dpid
+        dpid = tcp_client.dpid
+        supported = set()
+        # color_temp
+        if 3 in dpid:
+            supported.add(COLOR_MODE_COLOR_TEMP)
+        # brightness
+        if 4 in dpid:
+            supported.add(COLOR_MODE_BRIGHTNESS)
+        # color (hs)
+        if 5 in dpid or 6 in dpid:
+            supported.add(COLOR_MODE_HS)
 
-            if 3 in tcp_client.dpid:
-                self._attr_color_mode = COLOR_MODE_COLOR_TEMP
-                self._attr_supported_color_modes.add(COLOR_MODE_COLOR_TEMP)
-                
+        # If nothing is supported, use only onoff
+        if not supported:
+            supported = {COLOR_MODE_ONOFF}
 
-            if 4 in tcp_client.dpid:
-                self._attr_supported_color_modes.add(COLOR_MODE_BRIGHTNESS)
+        # Only valid combinations:
+        # If there are hs, brightness, color_temp — keep only valid sets
+        # onoff must not be mixed with other modes
+        if COLOR_MODE_ONOFF in supported and len(supported) > 1:
+            supported.remove(COLOR_MODE_ONOFF)
 
-            if 5 in tcp_client.dpid or 6 in tcp_client.dpid:
-                self._attr_color_mode = COLOR_MODE_HS
-                self._attr_supported_color_modes.add(COLOR_MODE_HS)
+        self._attr_supported_color_modes = supported
+        # Select main color mode
+        if COLOR_MODE_HS in supported:
+            self._attr_color_mode = COLOR_MODE_HS
+        elif COLOR_MODE_COLOR_TEMP in supported:
+            self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+        elif COLOR_MODE_BRIGHTNESS in supported:
+            self._attr_color_mode = COLOR_MODE_BRIGHTNESS
+        else:
+            self._attr_color_mode = COLOR_MODE_ONOFF
 
-        _LOGGER.info(f'after:{self._unique_id}._attr_color_mode={self._attr_color_mode}._attr_supported_color_modes='
-                     f'{self._attr_supported_color_modes}.dpid={tcp_client.dpid}')
-
-
-        #self._refresh_state()
+        _LOGGER.info(
+            f'{self._unique_id}: supported_color_modes='
+            f'{self._attr_supported_color_modes}, color_mode='
+            f'{self._attr_color_mode}, dpid={dpid}')
         self.SUPPORT_COZYLIGHT = self.get_supported_features()
 
     async def async_set_effect(self, effect: str):
@@ -305,7 +298,6 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self._effect = effect
         if self._attr_is_on:
             await self.async_turn_on(effect=effect)
-          
 
     @property
     def effect(self):
@@ -319,58 +311,68 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         return self._scenes
 
     def _refresh_state(self):
-        """
-        query device & set attr
-        :return:
-        """
+        # Query device & set attributes
         self._state = self._tcp_client.query()
         _LOGGER.info(f'_name={self._name},_state={self._state}')
         if self._state:
-            self._attr_is_on = 0 < self._state['1']
+            self._attr_is_on = self._state.get('1', 0) > 0
 
             if '2' in self._state:
                 if self._state['2'] == 0:
                     if '3' in self._state:
-                        #self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+                        # self._attr_color_mode = COLOR_MODE_COLOR_TEMP
                         color_temp = self._state['3']
                         if color_temp < 60000:
                             self._attr_color_mode = COLOR_MODE_COLOR_TEMP
                             self._attr_color_temp = round(
-                                self._max_mireds-self._state['3'] * self._miredsratio)
+
+                                self._max_mireds -
+
+                                self._state['3'] * self._miredsratio
+
+                            )
 
                     if '4' in self._state:
-                        self._attr_brightness = int(self._state['4'] / 1000 * 255)
+                        self._attr_brightness = int(
+
+                            self._state['4'] / 1000 * 255
+
+                        )
 
                     if '5' in self._state:
                         color = self._state['5']
                         if color < 60000:
                             self._attr_color_mode = COLOR_MODE_HS
                             r, g, b = colorutil.color_hs_to_RGB(
-                                round(self._state['5']), round(self._state['6'] / 10))
-                            ## May need to adjust
-                            hs_color = colorutil.color_RGB_to_hs(r, g, b)
+                                round(self._state['5']),
+                                round(self._state['6'] / 10))
+                            # May need to adjust
+                            hs_color = colorutil.color_RGB_to_hs(
+                                r, g, b)
                             self._attr_hs_color = hs_color
 
-    #autobrightness from circadian_lighting if enabled
+    # autobrightness from circadian_lighting if enabled
     def calc_color_temp(self):
-        if self._cl == None:
-          self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
-          if self._cl == None:
-            return None
+        if self._cl is None:
+            self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
+            if self._cl is None:
+                return None
         colortemp_in_kelvin = self._cl._colortemp
         autocolortemp = colorutil.color_temperature_kelvin_to_mired(
-            colortemp_in_kelvin)
+            colortemp_in_kelvin
+        )
         return autocolortemp
+
     def calc_brightness(self):
-        if self._cl == None:
-          self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
-          if self._cl == None:
-            return None
+        if self._cl is None:
+            self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
+            if self._cl is None:
+                return None
         if self._cl._percent > 0:
             return self._max_brightness
-        else:
-            return round(((self._max_brightness - self._min_brightness) * ((100+self._cl._percent) / 100)) + self._min_brightness)
-
+        return round(((self._max_brightness - self._min_brightness) *
+                      ((100 + self._cl._percent) / 100)) +
+                     self._min_brightness)
 
     @property
     def color_temp(self) -> int | None:
@@ -382,33 +384,29 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
 
         # 1-255
         brightness = kwargs.get(ATTR_BRIGHTNESS)
-
         # 153 ~ 370
         colortemp = kwargs.get(ATTR_COLOR_TEMP)
-
         # tuple
         hs_color = kwargs.get(ATTR_HS_COLOR)
-
         transition = kwargs.get(ATTR_TRANSITION)
-
-            
-
         # rgb = kwargs.get(ATTR_RGB_COLOR)
-        #flash = kwargs.get(ATTR_FLASH)
+        # flash = kwargs.get(ATTR_FLASH)
         effect = kwargs.get(ATTR_EFFECT)
-        
         originalcolortemp = self._attr_color_temp
         originalhs = self._attr_hs_color
         if self._attr_is_on:
             originalbrightness = self._attr_brightness
         else:
             originalbrightness = 0
-          #if self._attr_color_mode == COLOR_MODE_COLOR_TEMP:
-          #  originalcolortemp = self._attr_color_temp
-          #else:
-          #  originalhs = self._attr_hs_color
+        # if self._attr_color_mode == COLOR_MODE_COLOR_TEMP:
+        #     originalcolortemp = self._attr_color_temp
+        # else:
+        #     originalhs = self._attr_hs_color
         _LOGGER.info(
-            f'turn_on.kwargs={kwargs},colortemp={colortemp},hs_color={hs_color},originalbrightness={originalbrightness},self._attr_is_on={self._attr_is_on}')
+            f'turn_on.kwargs={kwargs}, colortemp={colortemp}, '
+            f'hs_color={hs_color}, '
+            f'originalbrightness={originalbrightness}, '
+            f'self._attr_is_on={self._attr_is_on}')
         self._attr_is_on = True
         self.async_write_ha_state()
         payload = {'1': 255, '2': 0}
@@ -423,7 +421,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
 
         if colortemp is not None:
             # 0-694
-            #payload['3'] = 1000 - colortemp * 2
+            # payload['3'] = 1000 - colortemp * 2
             self._effect = 'manual'
             self._attr_color_mode = COLOR_MODE_COLOR_TEMP
             self._attr_color_temp = colortemp
@@ -445,72 +443,103 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             count += 1
 
         if count == 0:
-            #autocolortemp when brightness color temp and hs_color is not set
-            if effect is not None: 
+            # Auto color temp when brightness, color temp not set
+            if effect is not None:
                 self._effect = effect
             if self._effect == 'natural':
                 if CIRCADIAN_BRIGHTNESS:
                     brightness = self.calc_brightness()
-                    payload['4'] = round(brightness / 255 * 1000)
+                    payload['4'] = round(
+                        brightness / 255 * 1000)
                     self._attr_brightness = brightness
                     self._attr_color_mode = COLOR_MODE_COLOR_TEMP
                     colortemp = self.calc_color_temp()
-                    payload['3'] = 1000 - \
-                        round((colortemp - self._min_mireds) / self._miredsratio)
-                    _LOGGER.info(f'color={colortemp},payload3={payload["3"]}')
-                    if self._transitioning !=0:
+                    payload['3'] = 1000 - round(
+                        (colortemp - self._min_mireds) /
+                        self._miredsratio)
+                    _LOGGER.info(
+                        f'color={colortemp},payload3={payload["3"]}')
+                    if self._transitioning != 0:
                         return None
                     if transition is None:
-                        transition=5
+                        transition = 5
             elif self._effect == 'sleep':
-                    payload['4'] = 4
-                    payload['3'] = 0
-                    payload['4'] = 12
-                    #brightness = 5
-                    #self._attr_brightness = brightness
-                    #payload['4'] = round(brightness / 255 * 1000)
-                    self._attr_color_mode = COLOR_MODE_COLOR_TEMP
-                    #self._attr_hs_color = (16,100)
-                    #payload['5'] = round(16)
-                    #payload['6'] = round(1000)
+                payload['4'] = 4
+                payload['3'] = 0
+                payload['4'] = 12
+                # brightness = 5
+                # self._attr_brightness = brightness
+                # payload['4'] = round(brightness / 255 * 1000)
+                self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+                # self._attr_hs_color = (16,100)
+                # payload['5'] = round(16)
+                # payload['6'] = round(1000)
             elif self._effect == 'study':
-                    payload['4'] = 1000
-                    payload['3'] = 1000
+                payload['4'] = 1000
+                payload['3'] = 1000
             elif self._effect == 'warm':
-                    payload['4'] = 1000
-                    payload['3'] = 0
+                payload['4'] = 1000
+                payload['3'] = 0
             elif self._effect == 'chrismas':
-                    payload['2'] = 1
-                    payload['4'] = 1000
-                    payload['8'] = 500
-                    payload['7'] = '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF010E03E8FFFF002603E8FFFF'
+                payload['2'] = 1
+                payload['4'] = 1000
+                payload['8'] = 500
+                payload['7'] = (
+
+                    '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF'
+
+                    '010E03E8FFFF002603E8FFFF'
+
+                )
 
         self._transitioning = 0
 
-        if transition: 
+        if transition:
             self._transitioning = time.time()
             now = self._transitioning
-            if self._effect =='chrismas':
-                await self.hass.async_add_executor_job(self._tcp_client.control, payload)
+            if self._effect == 'chrismas':
+                await self.hass.async_add_executor_job(
+
+                    self._tcp_client.control, payload
+
+                )
                 self._transitioning = 0
                 return None
             if brightness:
                 payloadtemp = {'1': 255, '2': 0}
                 p4i = round(originalbrightness / 255 * 1000)
                 p4f = payload['4']
-                p4steps = abs(round((p4i-p4f)/4))
-                _LOGGER.info(f'p4i={p4i},p4f={p4f},p4steps={p4steps}')
+                p4steps = abs(round((p4i - p4f) / 4))
+                _LOGGER.info(
+                    f'p4i={p4i},p4f={p4f},p4steps={p4steps}')
             else:
                 p4steps = 0
             if self._attr_color_mode == COLOR_MODE_COLOR_TEMP:
-                p3i = 1000 - round((originalcolortemp - self._min_mireds) / self._miredsratio)
+                p3i = 1000 - round(
+                    (originalcolortemp - self._min_mireds) / self._miredsratio)
                 p3steps = 0
                 if '3' in payload:
                     p3f = payload['3']
-                    p3steps = abs(round((p3i-p3f)/4))
-                _LOGGER.info(f'p3i={p3i},p3f={p3f},p3steps={p3steps}')
-                steps = p3steps if p3steps > p4steps else p4steps
-                if steps <= 0: 
+                    p3steps = abs(round(
+
+                        (p3i - p3f) / 4
+
+                    ))
+                _LOGGER.info(
+
+                    f'p3i={p3i}, '
+
+                    f'p3f={p3f}, '
+
+                    f'p3steps={p3steps}'
+
+                )
+                steps = (
+
+                    p3steps if p3steps > p4steps else p4steps
+
+                )
+                if steps <= 0:
                     self._transitioning = 0
                     return None
                 stepseconds = transition / steps
@@ -518,21 +547,31 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     stepseconds = MIN_INTERVAL
                     steps = round(transition / stepseconds)
                     stepseconds = transition / steps
-                _LOGGER.info(f'steps={steps},transition={transition},stepseconds={stepseconds},p3steps={p3steps},p4steps={p4steps}')
-                for s in range(1,steps+1):
-                    payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
+                _LOGGER.info(
+
+                    f'steps={steps}, transition={transition}, '
+
+                    f'stepseconds={stepseconds}, p3steps={p3steps}, '
+
+                    f'p4steps={p4steps}'
+
+                )
+                for s in range(1, steps + 1):
+                    brightness_value = p4i + (p4f - p4i) * s / steps
+                    payloadtemp['4'] = round(brightness_value)
                     if p3steps != 0:
-                        payloadtemp['3']= round(p3i + (p3f - p3i) * s / steps)
+                        payloadtemp['3'] = round(p3i + (p3f - p3i) * s / steps)
                     if now == self._transitioning:
                         await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
-                        _LOGGER.info(f'payloadtemp={payloadtemp},stepseconds={stepseconds}')
-                        if s<steps:
+                        _LOGGER.info(
+                            f'payloadtemp={payloadtemp},stepseconds={stepseconds}')
+                        if s < steps:
                             await asyncio.sleep(stepseconds)
                     else:
                         self._transitioning = 0
                         return None
 
-            elif  self._attr_color_mode == COLOR_MODE_HS:
+            elif self._attr_color_mode == COLOR_MODE_HS:
                 p5i = originalhs[0]
                 p6i = originalhs[1]*10
                 p5steps = 0
@@ -540,11 +579,17 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 if '5' in payload:
                     p5f = payload['5']
                     p6f = payload['6']
-                    p5steps = abs(round((p5i - p5f) / 3))
+                    p5steps = abs(round(
+
+                        (p5i - p5f) /
+
+                        3
+
+                    ))
                     p6steps = abs(round((p6i - p6f) / 10))
                 steps = max([p4steps, p5steps, p6steps])
                 if steps <= 0:
-                    self._transitioning = 0 
+                    self._transitioning = 0
                     return None
                 stepseconds = transition / steps
                 if stepseconds < 4:
@@ -552,18 +597,38 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     stepseconds = transition / steps
                 _LOGGER.info(f'steps={steps}')
                 for s in range(steps):
-                    payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
-                    if p5steps != 0: 
-                        payloadtemp['5']= round(p5i + (p5f - p5i) * s / steps)
-                        payloadtemp['6']= round(p6i + (p6f - p6i) * s / steps)
+                    payloadtemp['4'] = round(
+
+                        p4i + (p4f - p4i) * s /
+
+                        steps
+
+                    )
+                    if p5steps != 0:
+                        payloadtemp['5'] = round(
+
+                            p5i + (p5f - p5i) * s / steps
+
+                        )
+                        payloadtemp['6'] = round(p6i + (p6f - p6i) * s / steps)
                     if now == self._transitioning:
-                        await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
+                        await self.hass.async_add_executor_job(
+
+                            self._tcp_client.control,
+
+                            payloadtemp
+
+                        )
                         await asyncio.sleep(stepseconds)
                     else:
                         self._transitioning = 0
                         return None
         else:
-            await self.hass.async_add_executor_job(self._tcp_client.control, payload)
+            await self.hass.async_add_executor_job(
+
+                self._tcp_client.control, payload
+
+            )
         # self._refresh_state()
         self._transitioning = 0
         return None
@@ -574,10 +639,10 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self._attr_is_on = False
         self.async_write_ha_state()
         transition = kwargs.get(ATTR_TRANSITION)
-        originalbrightness=self._attr_brightness
+        originalbrightness = self._attr_brightness
         if self._effect == 'natural' and transition is None:
             transition = 5
-        if transition: 
+        if transition:
             self._transitioning = time.time()
             now = self._transitioning
             payloadtemp = {'1': 255, '2': 0}
@@ -589,40 +654,39 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 stepseconds = MIN_INTERVAL
                 steps = round(transition / stepseconds)
                 stepseconds = transition / steps
-            for s in range(1+steps+1):
-                payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
+            for s in range(1 + steps + 1):
+                payloadtemp['4'] = round(p4i + (p4f - p4i) * s / steps)
                 if now == self._transitioning:
                     await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
-                    if s<steps:
+                    if s < steps:
                         await asyncio.sleep(stepseconds)
                     else:
                         await super().async_turn_off()
                 else:
                     return None
-        else:    
-           await super().async_turn_off()
+        else:
+            await super().async_turn_off()
         self._transitioning = 0
         return None
-
 
     @property
     def hs_color(self) -> tuple[float, float] | None:
         """Return the hue and saturation color value [float, float]."""
-        #_LOGGER.info('hs_color')
+        # _LOGGER.info('hs_color')
         # self._refresh_state()
         return self._attr_hs_color
 
     @property
     def brightness(self) -> int | None:
         """Return the brightness of this light between 0..255."""
-        #_LOGGER.info('brightness')
+        # _LOGGER.info('brightness')
         # self._refresh_state()
         return self._attr_brightness
 
     @property
     def color_mode(self) -> str | None:
         """Return the color mode of the light."""
-        #_LOGGER.info('color_mode')
+        # _LOGGER.info('color_mode')
         return self._attr_color_mode
 
     @property
@@ -634,7 +698,6 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
     def max_mireds(self):
         """Return color temperature max mireds."""
         return self._max_mireds
-
 
     @property
     def assumed_state(self):
@@ -673,7 +736,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 features = features | SUPPORT_COLOR
             if COLOR_MODE_COLOR_TEMP in self._attr_supported_color_modes:
                 features = features | SUPPORT_COLOR_TEMP
-        except:
+        except Exception:
             pass
         # fallback
         return features
