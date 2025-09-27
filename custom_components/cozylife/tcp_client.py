@@ -195,7 +195,7 @@ class tcp_client(object):
             raise Exception('CMD is not valid')
 
         payload_str = json.dumps(message, separators=(',', ':',))
-        _LOGGER.info(f'_package={payload_str}')
+        # _LOGGER.info(f'_package={payload_str}')
         return bytes(payload_str + "\r\n", encoding='utf8')
 
     def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:

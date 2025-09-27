@@ -174,7 +174,7 @@ class CozyLifeSwitchAsLight(LightEntity):
 
     def _refresh_state(self):
         self._state = self._tcp_client.query()
-        _LOGGER.info(f"_name={self._name}, _state={self._state}")
+        # _LOGGER.info(f"_name={self._name}, _state={self._state}")
         if self._state:
             self._attr_is_on = self._state.get('1', 0) > 0
 
@@ -251,12 +251,12 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         # color_temp
         if 3 in dpid:
             supported.add(ColorMode.COLOR_TEMP)
-        # brightness
-        if 4 in dpid:
-            supported.add(ColorMode.BRIGHTNESS)
         # color (hs)
         if 5 in dpid or 6 in dpid:
             supported.add(ColorMode.HS)
+        # brightness only if no color modes
+        if 4 in dpid and not supported:
+            supported.add(ColorMode.BRIGHTNESS)
 
         # If nothing is supported, use only onoff
         if not supported:
@@ -306,7 +306,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     def _refresh_state(self):
         # Query device & set attributes
         self._state = self._tcp_client.query()
-        _LOGGER.info(f'_name={self._name},_state={self._state}')
+        # _LOGGER.info(f'_name={self._name},_state={self._state}')
         if self._state:
             self._attr_is_on = self._state.get('1', 0) > 0
 
@@ -458,13 +458,15 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     payload['4'] = round(
                         brightness / 255 * 1000)
                     self._attr_brightness = brightness
-                    self._attr_color_mode = ColorMode.COLOR_TEMP
-                    colortemp = self.calc_color_temp()
-                    payload['3'] = 1000 - round(
-                        (colortemp - self._min_mireds) /
-                        self._miredsratio)
-                    _LOGGER.info(
-                        f'color={colortemp},payload3={payload["3"]}')
+                    if (ColorMode.COLOR_TEMP in
+                            self._attr_supported_color_modes):
+                        self._attr_color_mode = ColorMode.COLOR_TEMP
+                        colortemp = self.calc_color_temp()
+                        payload['3'] = 1000 - round(
+                            (colortemp - self._min_mireds) /
+                            self._miredsratio)
+                        _LOGGER.info(
+                            f'color={colortemp},payload3={payload["3"]}')
                     if self._transitioning != 0:
                         return None
                     if transition is None:
@@ -476,7 +478,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 # brightness = 5
                 # self._attr_brightness = brightness
                 # payload['4'] = round(brightness / 255 * 1000)
-                self._attr_color_mode = ColorMode.COLOR_TEMP
+                if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
+                    self._attr_color_mode = ColorMode.COLOR_TEMP
                 # self._attr_hs_color = (16,100)
                 # payload['5'] = round(16)
                 # payload['6'] = round(1000)
@@ -491,11 +494,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 payload['4'] = 1000
                 payload['8'] = 500
                 payload['7'] = (
-
-                    '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF'
-
-                    '010E03E8FFFF002603E8FFFF'
-
+                    '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B4'
+                    '03E8FFFF010E03E8FFFF002603E8FFFF'
                 )
 
         self._transitioning = 0
@@ -568,9 +568,11 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     if p3steps != 0:
                         payloadtemp['3'] = round(p3i + (p3f - p3i) * s / steps)
                     if now == self._transitioning:
-                        await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
+                        await self.hass.async_add_executor_job(
+                            self._tcp_client.control, payloadtemp)
                         _LOGGER.info(
-                            f'payloadtemp={payloadtemp},stepseconds={stepseconds}')
+                            f'payloadtemp={payloadtemp}, '
+                            f'stepseconds={stepseconds}')
                         if s < steps:
                             await asyncio.sleep(stepseconds)
                     else:
@@ -663,7 +665,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             for s in range(1 + steps + 1):
                 payloadtemp['4'] = round(p4i + (p4f - p4i) * s / steps)
                 if now == self._transitioning:
-                    await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
+                    await self.hass.async_add_executor_job(
+                        self._tcp_client.control, payloadtemp)
                     if s < steps:
                         await asyncio.sleep(stepseconds)
                     else:

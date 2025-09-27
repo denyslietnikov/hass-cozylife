@@ -105,7 +105,7 @@ class CozyLifeSwitch(SwitchEntity):
 
     def _refresh_state(self):
         self._state = self._tcp_client.query()
-        _LOGGER.info(f'_name={self._name},_state={self._state}')
+        # _LOGGER.info(f'_name={self._name},_state={self._state}')
         if self._state:
             if self._wippe == 'wippe1':
                 self._attr_is_on = (self._state['1'] & 0x01) == 0x01
