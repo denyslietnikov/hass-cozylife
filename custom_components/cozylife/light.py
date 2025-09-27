@@ -10,7 +10,7 @@ from homeassistant.util import color as colorutil
 from homeassistant.components.light import (
     PLATFORM_SCHEMA,
     ATTR_BRIGHTNESS,
-    ATTR_COLOR_TEMP,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_HS_COLOR,
     ATTR_TRANSITION,
@@ -315,7 +315,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     if '3' in self._state:
                         # self._attr_color_mode = COLOR_MODE_COLOR_TEMP
                         color_temp = self._state['3']
-                        if color_temp < 60000:
+                        if (color_temp < 60000 and
+                                ColorMode.COLOR_TEMP in
+                                self._attr_supported_color_modes):
                             self._attr_color_mode = ColorMode.COLOR_TEMP
                             self._attr_color_temp = round(
 
@@ -334,7 +336,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
                     if '5' in self._state:
                         color = self._state['5']
-                        if color < 60000:
+                        if (color < 60000 and
+                                ColorMode.HS in
+                                self._attr_supported_color_modes):
                             self._attr_color_mode = ColorMode.HS
                             r, g, b = colorutil.color_hs_to_RGB(
                                 round(self._state['5']),
@@ -377,8 +381,13 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
         # 1-255
         brightness = kwargs.get(ATTR_BRIGHTNESS)
-        # 153 ~ 370
-        colortemp = kwargs.get(ATTR_COLOR_TEMP)
+        # 2700 ~ 6500 K
+        colortemp_kelvin = kwargs.get(
+            ATTR_COLOR_TEMP_KELVIN)
+        colortemp = None
+        if colortemp_kelvin is not None:
+            colortemp = colorutil.color_temperature_kelvin_to_mired(
+                colortemp_kelvin)
         # tuple
         hs_color = kwargs.get(ATTR_HS_COLOR)
         transition = kwargs.get(ATTR_TRANSITION)
@@ -412,7 +421,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             self._attr_brightness = brightness
             count += 1
 
-        if colortemp is not None:
+        if (colortemp is not None and
+                ColorMode.COLOR_TEMP in
+                self._attr_supported_color_modes):
             # 0-694
             # payload['3'] = 1000 - colortemp * 2
             self._effect = 'manual'
@@ -422,7 +433,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 round((colortemp - self._min_mireds) / self._miredsratio)
             count += 1
 
-        if hs_color is not None:
+        if (hs_color is not None and
+                ColorMode.HS in
+                self._attr_supported_color_modes):
             # 0-360
             # 0-1000
             self._effect = 'manual'
