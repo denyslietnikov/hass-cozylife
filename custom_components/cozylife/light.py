@@ -14,15 +14,8 @@ from homeassistant.components.light import (
     ATTR_EFFECT,
     ATTR_HS_COLOR,
     ATTR_TRANSITION,
-    COLOR_MODE_BRIGHTNESS,
-    COLOR_MODE_COLOR_TEMP,
-    COLOR_MODE_HS,
-    COLOR_MODE_ONOFF,
-    SUPPORT_EFFECT,
-    SUPPORT_TRANSITION,
-    SUPPORT_BRIGHTNESS,
-    SUPPORT_COLOR,
-    SUPPORT_COLOR_TEMP,
+    ColorMode,
+    LightEntityFeature,
     LightEntity,
 )
 from homeassistant.const import CONF_EFFECT
@@ -257,34 +250,34 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         supported = set()
         # color_temp
         if 3 in dpid:
-            supported.add(COLOR_MODE_COLOR_TEMP)
+            supported.add(ColorMode.COLOR_TEMP)
         # brightness
         if 4 in dpid:
-            supported.add(COLOR_MODE_BRIGHTNESS)
+            supported.add(ColorMode.BRIGHTNESS)
         # color (hs)
         if 5 in dpid or 6 in dpid:
-            supported.add(COLOR_MODE_HS)
+            supported.add(ColorMode.HS)
 
         # If nothing is supported, use only onoff
         if not supported:
-            supported = {COLOR_MODE_ONOFF}
+            supported = {ColorMode.ONOFF}
 
         # Only valid combinations:
         # If there are hs, brightness, color_temp — keep only valid sets
         # onoff must not be mixed with other modes
-        if COLOR_MODE_ONOFF in supported and len(supported) > 1:
-            supported.remove(COLOR_MODE_ONOFF)
+        if ColorMode.ONOFF in supported and len(supported) > 1:
+            supported.remove(ColorMode.ONOFF)
 
         self._attr_supported_color_modes = supported
         # Select main color mode
-        if COLOR_MODE_HS in supported:
-            self._attr_color_mode = COLOR_MODE_HS
-        elif COLOR_MODE_COLOR_TEMP in supported:
-            self._attr_color_mode = COLOR_MODE_COLOR_TEMP
-        elif COLOR_MODE_BRIGHTNESS in supported:
-            self._attr_color_mode = COLOR_MODE_BRIGHTNESS
+        if ColorMode.HS in supported:
+            self._attr_color_mode = ColorMode.HS
+        elif ColorMode.COLOR_TEMP in supported:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        elif ColorMode.BRIGHTNESS in supported:
+            self._attr_color_mode = ColorMode.BRIGHTNESS
         else:
-            self._attr_color_mode = COLOR_MODE_ONOFF
+            self._attr_color_mode = ColorMode.ONOFF
 
         _LOGGER.info(
             f'{self._unique_id}: supported_color_modes='
@@ -323,7 +316,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                         # self._attr_color_mode = COLOR_MODE_COLOR_TEMP
                         color_temp = self._state['3']
                         if color_temp < 60000:
-                            self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+                            self._attr_color_mode = ColorMode.COLOR_TEMP
                             self._attr_color_temp = round(
 
                                 self._max_mireds -
@@ -342,7 +335,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     if '5' in self._state:
                         color = self._state['5']
                         if color < 60000:
-                            self._attr_color_mode = COLOR_MODE_HS
+                            self._attr_color_mode = ColorMode.HS
                             r, g, b = colorutil.color_hs_to_RGB(
                                 round(self._state['5']),
                                 round(self._state['6'] / 10))
@@ -423,7 +416,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             # 0-694
             # payload['3'] = 1000 - colortemp * 2
             self._effect = 'manual'
-            self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+            self._attr_color_mode = ColorMode.COLOR_TEMP
             self._attr_color_temp = colortemp
             payload['3'] = 1000 - \
                 round((colortemp - self._min_mireds) / self._miredsratio)
@@ -433,7 +426,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             # 0-360
             # 0-1000
             self._effect = 'manual'
-            self._attr_color_mode = COLOR_MODE_HS
+            self._attr_color_mode = ColorMode.HS
             self._attr_hs_color = hs_color
             r, g, b = colorutil.color_hs_to_RGB(*hs_color)
             # color is not balanced right. needs additional tuning
@@ -452,7 +445,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     payload['4'] = round(
                         brightness / 255 * 1000)
                     self._attr_brightness = brightness
-                    self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+                    self._attr_color_mode = ColorMode.COLOR_TEMP
                     colortemp = self.calc_color_temp()
                     payload['3'] = 1000 - round(
                         (colortemp - self._min_mireds) /
@@ -470,7 +463,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 # brightness = 5
                 # self._attr_brightness = brightness
                 # payload['4'] = round(brightness / 255 * 1000)
-                self._attr_color_mode = COLOR_MODE_COLOR_TEMP
+                self._attr_color_mode = ColorMode.COLOR_TEMP
                 # self._attr_hs_color = (16,100)
                 # payload['5'] = round(16)
                 # payload['6'] = round(1000)
@@ -514,7 +507,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     f'p4i={p4i},p4f={p4f},p4steps={p4steps}')
             else:
                 p4steps = 0
-            if self._attr_color_mode == COLOR_MODE_COLOR_TEMP:
+            if self._attr_color_mode == ColorMode.COLOR_TEMP:
                 p3i = 1000 - round(
                     (originalcolortemp - self._min_mireds) / self._miredsratio)
                 p3steps = 0
@@ -571,7 +564,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                         self._transitioning = 0
                         return None
 
-            elif self._attr_color_mode == COLOR_MODE_HS:
+            elif self._attr_color_mode == ColorMode.HS:
                 p5i = originalhs[0]
                 p6i = originalhs[1]*10
                 p5steps = 0
@@ -726,17 +719,4 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     def get_supported_features(self) -> int:
         """Flag supported features."""
-        features = 0
-        features = features | SUPPORT_EFFECT | SUPPORT_TRANSITION
-        try:
-            # Map features for better reading
-            if COLOR_MODE_BRIGHTNESS in self._attr_supported_color_modes:
-                features = features | SUPPORT_BRIGHTNESS
-            if COLOR_MODE_HS in self._attr_supported_color_modes:
-                features = features | SUPPORT_COLOR
-            if COLOR_MODE_COLOR_TEMP in self._attr_supported_color_modes:
-                features = features | SUPPORT_COLOR_TEMP
-        except Exception:
-            pass
-        # fallback
-        return features
+        return LightEntityFeature.EFFECT | LightEntityFeature.TRANSITION
