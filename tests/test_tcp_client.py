@@ -21,6 +21,21 @@ async def test_tcp_client_connect(mock_device):
 
 
 @pytest.mark.asyncio
+async def test_tcp_client_ping(mock_device):
+    """Test ping keeps connection healthy."""
+    device, host, port = mock_device
+    client = tcp_client(host, timeout=1.0)
+    client._port = port
+
+    await client._connect()
+    await client._ping()
+
+    assert client.available
+
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_tcp_client_device_info(mock_device, mocker):
     """Test getting device info."""
     device, host, port = mock_device

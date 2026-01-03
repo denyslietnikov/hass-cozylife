@@ -45,7 +45,10 @@ LIGHT_SCHEMA = vol.Schema(
 )
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Optional("lights", default=[]): vol.All(cv.ensure_list, [LIGHT_SCHEMA])}
+    {
+        vol.Optional("lights", default=[]): vol.All(cv.ensure_list, [LIGHT_SCHEMA]),
+        vol.Optional("optimistic", default=False): cv.boolean,
+    }
 )
 
 
@@ -101,6 +104,7 @@ async def async_setup_platform(
     lights = []
     # treat switch as light in home assistant
     switches = []
+    optimistic = config.get("optimistic", False)
     for item in config.get("lights"):
         client = tcp_client(item.get("ip"))
         client._device_id = item.get("did")
@@ -108,9 +112,9 @@ async def async_setup_platform(
         client._dpid = item.get("dpid")
         client._device_model_name = item.get("dmn")
         if "switch" not in client._device_model_name.lower():
-            lights.append(CozyLifeLight(client, hass, scenes))
+            lights.append(CozyLifeLight(client, hass, scenes, optimistic))
         else:
-            switches.append(CozyLifeSwitchAsLight(client, hass))
+            switches.append(CozyLifeSwitchAsLight(client, hass, optimistic))
 
     async_add_devices(lights)
     for light in lights:
@@ -126,7 +130,8 @@ async def async_setup_platform(
                 await light._refresh_state()
             await asyncio.sleep(0.1)
 
-    async_track_time_interval(hass, async_update_lights, SCAN_INTERVAL)
+    if not optimistic:
+        async_track_time_interval(hass, async_update_lights, SCAN_INTERVAL)
 
     async_add_devices(switches)
     for light in switches:
@@ -139,7 +144,8 @@ async def async_setup_platform(
             await light._refresh_state()
             await asyncio.sleep(0.1)
 
-    async_track_time_interval(hass, async_update_switches, SWITCH_SCAN_INTERVAL)
+    if not optimistic:
+        async_track_time_interval(hass, async_update_switches, SWITCH_SCAN_INTERVAL)
 
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
@@ -159,13 +165,14 @@ class CozyLifeSwitchAsLight(LightEntity):
     _attr_is_on = True
     _unrecorded_attributes = frozenset({"brightness", "color_temp"})
 
-    def __init__(self, tcp_client: tcp_client, hass) -> None:
+    def __init__(self, tcp_client: tcp_client, hass, optimistic: bool = False) -> None:
         """Initialize the sensor."""
         _LOGGER.info("__init__")
         self.hass = hass
         self._tcp_client = tcp_client
         self._unique_id = tcp_client.device_id
         self._name = tcp_client.device_id[-4:]
+        self._optimistic = optimistic
 
     @property
     def unique_id(self) -> str | None:
@@ -173,7 +180,8 @@ class CozyLifeSwitchAsLight(LightEntity):
         return self._unique_id
 
     async def async_update(self):
-        await self._refresh_state()
+        if not self._optimistic:
+            await self._refresh_state()
 
     async def _refresh_state(self):
         self._state = await self._tcp_client.query()
@@ -223,7 +231,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     _attr_supported_color_modes = None
     _attr_color_mode = None
 
-    def __init__(self, tcp_client: tcp_client, hass, scenes) -> None:
+    def __init__(
+        self, tcp_client: tcp_client, hass, scenes, optimistic: bool = False
+    ) -> None:
         """Initialize the sensor."""
         _LOGGER.info("__init__")
         self.hass = hass
@@ -243,6 +253,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._transitioning = 0
         self._attr_is_on = False
         self._attr_brightness = 0
+        self._optimistic = optimistic
 
         # Automatically determine supported color modes by dpid
         dpid = tcp_client.dpid

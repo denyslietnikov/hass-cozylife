@@ -7,13 +7,23 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.components.switch import SwitchEntity
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
+from homeassistant.components.switch import PLATFORM_SCHEMA, SwitchEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .tcp_client import tcp_client
+
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+    {
+        vol.Optional("switches", default=[]): vol.All(cv.ensure_list, [dict]),
+        vol.Optional("switches2", default=[]): vol.All(cv.ensure_list, [dict]),
+        vol.Optional("optimistic", default=False): cv.boolean,
+    }
+)
 
 SCAN_INTERVAL = timedelta(seconds=20)
 
@@ -39,13 +49,14 @@ async def async_setup_platform(
     #    return
 
     switches = []
+    optimistic = config.get("optimistic", False)
     for item in config.get("switches") or []:
         client = tcp_client(item.get("ip"))
         client._device_id = item.get("did")
         client._pid = item.get("pid")
         client._dpid = item.get("dpid")
         client._device_model_name = item.get("dmn")
-        switches.append(CozyLifeSwitch(client, hass, "wippe1"))
+        switches.append(CozyLifeSwitch(client, hass, "wippe1", optimistic))
 
     for item in config.get("switches2") or []:
         client = tcp_client(item.get("ip"))
@@ -55,8 +66,8 @@ async def async_setup_platform(
         client._device_model_name = item.get("dmn")
 
         # Create two entities for each switch, one for each rocker
-        switches.append(CozyLifeSwitch(client, hass, "wippe1"))
-        switches.append(CozyLifeSwitch(client, hass, "wippe2"))
+        switches.append(CozyLifeSwitch(client, hass, "wippe1", optimistic))
+        switches.append(CozyLifeSwitch(client, hass, "wippe2", optimistic))
 
     async_add_devices(switches)
     for switch in switches:
@@ -69,7 +80,8 @@ async def async_setup_platform(
             await switch._refresh_state()
             await asyncio.sleep(0.01)
 
-    async_track_time_interval(hass, async_update, SCAN_INTERVAL)
+    if not optimistic:
+        async_track_time_interval(hass, async_update, SCAN_INTERVAL)
 
 
 class CozyLifeSwitch(SwitchEntity):
@@ -77,7 +89,9 @@ class CozyLifeSwitch(SwitchEntity):
     _attr_is_on = True
     _wippe = None  # Add a new attribute to track the rocker
 
-    def __init__(self, tcp_client: tcp_client, hass, wippe: str) -> None:
+    def __init__(
+        self, tcp_client: tcp_client, hass, wippe: str, optimistic: bool = False
+    ) -> None:
         """Initialize the sensor."""
         _LOGGER.info("__init__")
         self.hass = hass
@@ -85,6 +99,7 @@ class CozyLifeSwitch(SwitchEntity):
         self._unique_id = tcp_client.device_id + "_" + wippe
         self._name = tcp_client.device_id[-4:] + " " + wippe
         self._wippe = wippe  # Set the rocker attribute
+        self._optimistic = optimistic
         # self._refresh_state()  # Remove sync call in __init__
 
     @property
@@ -93,7 +108,8 @@ class CozyLifeSwitch(SwitchEntity):
         return self._unique_id
 
     async def async_update(self):
-        await self._refresh_state()
+        if not self._optimistic:
+            await self._refresh_state()
 
     async def _refresh_state(self):
         self._state = await self._tcp_client.query()
