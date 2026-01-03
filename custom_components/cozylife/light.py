@@ -320,36 +320,37 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         if self._state:
             self._attr_is_on = self._state.get("1", 0) > 0
 
-            if "2" in self._state:
-                if self._state["2"] == 0:
-                    if "3" in self._state:
-                        # self._attr_color_mode = COLOR_MODE_COLOR_TEMP
-                        color_temp = self._state["3"]
-                        if (
-                            color_temp < 60000
-                            and ColorMode.COLOR_TEMP in self._attr_supported_color_modes
-                        ):
-                            self._attr_color_mode = ColorMode.COLOR_TEMP
-                            self._attr_color_temp = round(
-                                self._max_mireds - self._state["3"] * self._miredsratio
-                            )
+            # Always update brightness if available
+            if "4" in self._state:
+                self._attr_brightness = int(self._state["4"] / 1000 * 255)
 
-                    if "4" in self._state:
-                        self._attr_brightness = int(self._state["4"] / 1000 * 255)
-
-                    if "5" in self._state:
-                        color = self._state["5"]
-                        if (
-                            color < 60000
-                            and ColorMode.HS in self._attr_supported_color_modes
-                        ):
-                            self._attr_color_mode = ColorMode.HS
-                            r, g, b = colorutil.color_hs_to_RGB(
-                                round(self._state["5"]), round(self._state["6"] / 10)
-                            )
-                            # May need to adjust
-                            hs_color = colorutil.color_RGB_to_hs(r, g, b)
-                            self._attr_hs_color = hs_color
+            mode = self._state.get("2", 0)
+            if mode == 0:  # White mode
+                if (
+                    "3" in self._state
+                    and ColorMode.COLOR_TEMP in self._attr_supported_color_modes
+                ):
+                    color_temp = self._state["3"]
+                    if color_temp < 60000:
+                        self._attr_color_mode = ColorMode.COLOR_TEMP
+                        self._attr_color_temp = round(
+                            self._max_mireds - color_temp * self._miredsratio
+                        )
+            elif mode == 1:  # RGB or Effect mode
+                if (
+                    "5" in self._state
+                    and "6" in self._state
+                    and ColorMode.HS in self._attr_supported_color_modes
+                ):
+                    color = self._state["5"]
+                    if color < 60000:
+                        self._attr_color_mode = ColorMode.HS
+                        r, g, b = colorutil.color_hs_to_RGB(
+                            round(self._state["5"]), round(self._state["6"] / 10)
+                        )
+                        # May need to adjust
+                        hs_color = colorutil.color_RGB_to_hs(r, g, b)
+                        self._attr_hs_color = hs_color
 
     # autobrightness from circadian_lighting if enabled
     def calc_color_temp(self):
@@ -380,6 +381,23 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     def color_temp(self) -> int | None:
         """Return the CT color value in mireds."""
         return self._attr_color_temp
+
+    @property
+    def min_color_temp_kelvin(self) -> int:
+        """Return the minimum color temperature in Kelvin."""
+        return 2700
+
+    @property
+    def max_color_temp_kelvin(self) -> int:
+        """Return the maximum color temperature in Kelvin."""
+        return 6500
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        """Return the CT color value in Kelvin."""
+        if self._attr_color_temp is not None:
+            return colorutil.color_temperature_mired_to_kelvin(self._attr_color_temp)
+        return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
@@ -450,7 +468,6 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             hs_color = colorutil.color_RGB_to_hs(r, g, b)
             payload["5"] = round(hs_color[0])
             payload["6"] = round(hs_color[1] * 10)
-            payload["2"] = 1  # RGB mode
             count += 1
 
         if count == 0:
@@ -503,6 +520,14 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     "03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B4"
                     "03E8FFFF010E03E8FFFF002603E8FFFF"
                 )
+
+        # Set mode based on current state or new settings
+        if self._effect != "manual":
+            payload["2"] = 1  # Effect mode
+        elif self._attr_color_mode == ColorMode.HS or hs_color is not None:
+            payload["2"] = 1  # RGB mode
+        else:
+            payload["2"] = 0  # White mode
 
         self._transitioning = 0
 
