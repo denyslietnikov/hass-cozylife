@@ -2,7 +2,7 @@
 
 ## What is it
 
-This a third-party home assistant custom components works for Cozylife Lights based on [the official repository](https://github.com/cozylife/hass_cozylife_local_pull). The official repo is buggy in too many ways. This one heavily modified. 
+This a third-party home assistant custom components works for Cozylife Lights based on [the official repository](https://github.com/cozylife/hass_cozylife_local_pull). The official repo is buggy in too many ways. This one heavily modified.
 
 * It is a pure local version and does not use UDP discovery.
 
@@ -16,10 +16,10 @@ This a third-party home assistant custom components works for Cozylife Lights ba
 * fixed the color temperature
 
 
-## Tested Product 
+## Tested Product
 
 Tested it on [color bulbs (no homekit)](https://detail.1688.com/offer/617699711703.html?spm=a2615.2177701.autotrace-offerGeneral.1.12be5799WNMB96).
-It can be initialized though bluetooth. 
+It can be initialized though bluetooth.
 
 It has also been tested on [color bulbs (with homekit)](https://www.aliexpress.com/item/4001365774507.html). It can run both Apple homekit and Home Assistant simultaneously.
 
@@ -28,8 +28,8 @@ CW lights should work.
 
 ## How I Setup the bulb
 
-The bulb will phone home to dohome.doiting.com. I blocked the dns request (you might also be able to block the internet access entirely, have not tested). This makes the registration process half complete. 
-But the app could transmit the wifi name and password to the bulb. 
+The bulb will phone home to dohome.doiting.com. I blocked the dns request (you might also be able to block the internet access entirely, have not tested). This makes the registration process half complete.
+But the app could transmit the wifi name and password to the bulb.
 In principle, if you complete the full registration with the cloud, the bulb will respond to UDP discovery.
 However, my bulbs does not respond to UDP discovery, not sure if is because the code I used was buggy.
 
@@ -114,10 +114,10 @@ TTTT is color temperature.
 0e: 3 fast flash
 0f: 7 fast flash
 
-#### Only for color 
+#### Only for color
 
-00: 1 smooth change color rotation 
-01: 2 smooth change color rotation 
+00: 1 smooth change color rotation
+01: 2 smooth change color rotation
 02: 3 smooth change color rotation
 03: 7 smooth change color rotation (rainbow effects)
 
@@ -159,7 +159,7 @@ TTTT is color temperature.
  '8': 800}
 
 
-##### Single color 
+##### Single color
 
 Soft (0078: 120  03E8: 1000)
 {'1': 1,
@@ -199,3 +199,48 @@ Reading: (brightness 1000, color temp middle, 01F4: 500)
  '4': 1000,
  '7': '01 FFFF FFFF 01F4 FFFF FFFF 01F4 000000000000000000000000000000000000000000000000000000000000',
  '8': 1000}
+
+## Development
+
+This project uses pre-commit hooks to ensure code quality and consistency with Home Assistant standards.
+
+### Setup
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+2. Install pre-commit hooks:
+```bash
+pre-commit install
+```
+
+### Code Quality Checks
+
+The following tools are used:
+
+- **Black**: Python code formatting
+- **isort**: Import sorting
+- **Ruff**: Fast Python linter and formatter
+- **Prettier**: YAML formatting
+- **Pre-commit hooks**: Various checks for common issues
+
+### Running Checks
+
+Run all checks on all files:
+```bash
+pre-commit run --all-files
+```
+
+Run checks on staged files (automatically runs on commit):
+```bash
+pre-commit run
+```
+
+### Testing
+
+Run the test suite:
+```bash
+pytest --asyncio-mode=auto tests/
+```
