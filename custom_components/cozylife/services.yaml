@@ -9,12 +9,12 @@ set_all_effect:
       selector:
         select:
           options:
-            - 'manual'
-            - 'natural'
-            - 'sleep'
-            - 'warm'
-            - 'study'
-            - 'chrismas'
+            - "manual"
+            - "natural"
+            - "sleep"
+            - "warm"
+            - "study"
+            - "chrismas"
 set_effect:
   name: Set effect
   description: Set a the light effect.
@@ -30,9 +30,9 @@ set_effect:
       selector:
         select:
           options:
-            - 'manual'
-            - 'natural'
-            - 'sleep'
-            - 'warm'
-            - 'study'
-            - 'chrismas'
+            - "manual"
+            - "natural"
+            - "sleep"
+            - "warm"
+            - "study"
+            - "chrismas"

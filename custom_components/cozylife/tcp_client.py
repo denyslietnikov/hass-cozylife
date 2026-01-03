@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import json
-import socket
-import time
-from typing import Optional, Union, Any
 import logging
+from typing import Any, Optional, Union
+
 try:
-  from .utils import get_pid_list, get_sn
-except:
-  from utils import get_pid_list, get_sn
+    from .utils import get_pid_list, get_sn
+except ImportError:
+    from utils import get_pid_list, get_sn
 
 CMD_INFO = 0
 CMD_QUERY = 2
@@ -32,45 +32,121 @@ class tcp_client(object):
     receiver:{"cmd":10,"pv":0,"sn":"1636463664000","res":0,"msg":{"attr":[1,2,3,4,5,6],"data":{"1":0,"2":0,"3":1000,
     "4":1000,"5":65535,"6":65535}}}
     """
+
     _ip = str
     _port = 5555
-    _connect = None  # socket
+    _reader: Optional[asyncio.StreamReader] = None
+    _writer: Optional[asyncio.StreamWriter] = None
 
-    _device_id = str  # str
+    _device_id = None  # str
     # _device_key = str
-    _pid = str
-    _device_type_code = str
-    _icon = str
-    _device_model_name = str
+    _pid = None
+    _device_type_code = None
+    _icon = None
+    _device_model_name = None
     _dpid = []
     # last sn
-    _sn = str
+    _sn = None
+    _heartbeat_task: Optional[asyncio.Task] = None
 
     def __init__(self, ip, timeout=3):
         self._ip = ip
         self.timeout = timeout
+        self._heartbeat_task = None
 
-    def disconnect(self):
-        if self._connect:
-            try: 
-                #self._connect.shutdown(socket.SHUT_RDWR)
-                self._connect.close()
-            except:
+    async def disconnect(self):
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        if self._writer:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
                 pass
-        self._connect = None
+        self._reader = None
+        self._writer = None
+        self._heartbeat_task = None
 
     def __del__(self):
-        self.disconnect()
+        # Note: __del__ cannot be async, but we can close synchronously if needed
+        if self._writer:
+            self._writer.close()
 
-    def _initSocket(self):
+    def _start_heartbeat(self):
+        """Start the heartbeat task if not already running."""
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _ping(self) -> None:
+        """Send a ping to check connection and clear response buffer."""
+        # Send CMD_INFO and read a single response line to avoid buffer accumulation
+        if not await self._ensure_connected():
+            raise ConnectionError("Ping failed: not connected")
+        self._writer.write(self._get_package(CMD_INFO, {}))
+        await self._writer.drain()
+        await asyncio.wait_for(self._reader.readline(), timeout=self.timeout)
+
+    async def _heartbeat(self):
+        """Heartbeat task to maintain connection."""
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            if not self.available:
+                _LOGGER.info(
+                    f"Heartbeat: Connection not available for {self._ip}, attempting reconnect"
+                )
+                try:
+                    await self._connect()
+                    if self.available:
+                        _LOGGER.info(f"Heartbeat: Reconnected to {self._ip}")
+                    else:
+                        _LOGGER.warning(f"Heartbeat: Failed to reconnect to {self._ip}")
+                except Exception as e:
+                    _LOGGER.warning(f"Heartbeat: Reconnect failed for {self._ip}: {e}")
+                continue
+            try:
+                # Send a ping to verify connection is alive
+                await self._ping()
+            except Exception as e:
+                _LOGGER.info(
+                    f"Heartbeat: Ping failed for {self._ip} ({e}), attempting reconnect"
+                )
+                try:
+                    await self._connect()
+                    if self.available:
+                        _LOGGER.info(f"Heartbeat: Reconnected to {self._ip}")
+                    else:
+                        _LOGGER.warning(f"Heartbeat: Failed to reconnect to {self._ip}")
+                except Exception as e2:
+                    _LOGGER.warning(f"Heartbeat: Reconnect failed for {self._ip}: {e2}")
+
+    async def _ensure_connected(self):
+        """Ensure device is connected, attempt reconnect if needed."""
+        if not self.available:
+            _LOGGER.info(f"Ensuring connection for {self._ip}")
+            try:
+                await self._connect()
+                if self.available:
+                    _LOGGER.info(f"Reconnected to {self._ip}")
+                    # Start heartbeat if not running
+                    self._start_heartbeat()
+                else:
+                    _LOGGER.warning(f"Failed to reconnect to {self._ip}")
+                    return False
+            except Exception as e:
+                _LOGGER.warning(f"Reconnect failed for {self._ip}: {e}")
+                return False
+        return True
+
+    async def _connect(self):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(self.timeout)
-            s.connect((self._ip, self._port))
-            self._connect = s
-        except:
-            _LOGGER.info(f'_initSocketerror,ip={self._ip}')
-            self.disconnect()
+            self._reader, self._writer = await asyncio.open_connection(
+                self._ip, self._port
+            )
+            # Start heartbeat after successful connection
+            self._start_heartbeat()
+        except Exception as e:
+            _LOGGER.info(f"_connect error, ip={self._ip}: {e}")
+            await self.disconnect()
 
     @property
     def check(self) -> bool:
@@ -100,54 +176,72 @@ class tcp_client(object):
     def device_id(self):
         return self._device_id
 
-    def _device_info(self) -> None:
+    @property
+    def available(self) -> bool:
+        """Check if device is connected and available."""
+        return self._writer is not None and not self._writer.is_closing()
+
+    async def _device_info(self) -> None:
         """
         get info for device model
         :return:
         """
-        self._only_send(CMD_INFO, {})
+        if not await self._ensure_connected():
+            return
+        package = self._get_package(CMD_INFO, {})
         try:
+            self._writer.write(package)
+            await self._writer.drain()
+        except Exception:
             try:
-                resp = self._connect.recv(1024)
-            except:
-                self.disconnect()
-                self._initSocket()
-                return None
+                await self.disconnect()
+                await self._connect()
+                if self._writer:
+                    self._writer.write(package)
+                    await self._writer.drain()
+            except Exception:
+                return
+
+        try:
+            resp = await asyncio.wait_for(self._reader.read(1024), timeout=self.timeout)
+            if not resp:
+                return
             resp_json = json.loads(resp.strip())
-        except:
-            _LOGGER.info('_device_info.recv.error')
-            return None
+        except asyncio.TimeoutError:
+            _LOGGER.info("_device_info: timeout")
+            return
+        except Exception:
+            _LOGGER.info("_device_info.recv.error")
+            return
 
-        if resp_json.get('msg') is None or type(resp_json['msg']) is not dict:
-            _LOGGER.info('_device_info.recv.error1')
+        if resp_json.get("msg") is None or type(resp_json["msg"]) is not dict:
+            _LOGGER.info("_device_info.recv.error1")
+            return
 
-            return None
+        if resp_json["msg"].get("did") is None:
+            _LOGGER.info("_device_info.recv.error2")
+            return
+        self._device_id = resp_json["msg"]["did"]
 
-        if resp_json['msg'].get('did') is None:
-            _LOGGER.info('_device_info.recv.error2')
+        if resp_json["msg"].get("pid") is None:
+            _LOGGER.info("_device_info.recv.error3")
+            return
 
-            return None
-        self._device_id = resp_json['msg']['did']
+        self._pid = resp_json["msg"]["pid"]
 
-        if resp_json['msg'].get('pid') is None:
-            _LOGGER.info('_device_info.recv.error3')
-            return None
-
-        self._pid = resp_json['msg']['pid']
-
-        pid_list = get_pid_list()
+        pid_list = await get_pid_list()
         for item in pid_list:
             match = False
-            for item1 in item['device_model']:
-                if item1['device_product_id'] == self._pid:
+            for item1 in item["device_model"]:
+                if item1["device_product_id"] == self._pid:
                     match = True
-                    self._icon = item1['icon']
-                    self._device_model_name = item1['device_model_name']
-                    self._dpid = item1['dpid']
+                    self._icon = item1["icon"]
+                    self._device_model_name = item1["device_model_name"]
+                    self._dpid = item1["dpid"]
                     break
 
             if match:
-                self._device_type_code = item['device_type_code']
+                self._device_type_code = item["device_type_code"]
                 break
 
         # _LOGGER.info(pid_list)
@@ -167,110 +261,172 @@ class tcp_client(object):
         self._sn = get_sn()
         if CMD_SET == cmd:
             message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {
-                    'attr': [int(item) for item in payload.keys()],
-                    'data': payload,
-                }
+                "pv": 0,
+                "cmd": cmd,
+                "sn": self._sn,
+                "msg": {
+                    "attr": [int(item) for item in payload.keys()],
+                    "data": payload,
+                },
             }
         elif CMD_QUERY == cmd:
             message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {
-                    'attr': [0],
-                }
+                "pv": 0,
+                "cmd": cmd,
+                "sn": self._sn,
+                "msg": {
+                    "attr": [0],
+                },
             }
         elif CMD_INFO == cmd:
-            message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {}
-            }
+            message = {"pv": 0, "cmd": cmd, "sn": self._sn, "msg": {}}
         else:
-            raise Exception('CMD is not valid')
+            raise Exception("CMD is not valid")
 
-        payload_str = json.dumps(message, separators=(',', ':',))
+        payload_str = json.dumps(
+            message,
+            separators=(
+                ",",
+                ":",
+            ),
+        )
         # _LOGGER.info(f'_package={payload_str}')
-        return bytes(payload_str + "\r\n", encoding='utf8')
+        return bytes(payload_str + "\r\n", encoding="utf8")
 
-    def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:
+    async def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:
         """
         send & receiver
         :param cmd:
         :param payload:
         :return:
         """
+        if not await self._ensure_connected():
+            return None
         try:
-            self._connect.send(self._get_package(cmd, payload))
-        except:
+            self._writer.write(self._get_package(cmd, payload))
+            await self._writer.drain()
+        except Exception:
             try:
-                self.disconnect()
-                self._initSocket()
-                self._connect.send(self._get_package(cmd, payload))
-            except:
+                await self.disconnect()
+                await self._connect()
+                if self._writer:
+                    self._writer.write(self._get_package(cmd, payload))
+                    await self._writer.drain()
+            except Exception:
                 pass
         try:
             i = 10
             while i > 0:
-                res = self._connect.recv(1024)
+                try:
+                    res = await asyncio.wait_for(
+                        self._reader.readline(), timeout=self.timeout
+                    )
+                except asyncio.TimeoutError:
+                    i -= 1
+                    continue
                 # print(f'res={res},sn={self._sn},{self._sn in str(res)}')
                 i -= 1
                 # only allow same sn
-                if self._sn in str(res):
+                if self._sn in res.decode("utf-8"):
                     payload = json.loads(res.strip())
                     if payload is None or len(payload) == 0:
                         return None
 
-                    if payload.get('msg') is None or type(payload['msg']) is not dict:
+                    if payload.get("msg") is None or type(payload["msg"]) is not dict:
                         return None
 
-                    if payload['msg'].get('data') is None or type(payload['msg']['data']) is not dict:
+                    if (
+                        payload["msg"].get("data") is None
+                        or type(payload["msg"]["data"]) is not dict
+                    ):
                         return None
 
-                    return payload['msg']['data']
+                    return payload["msg"]["data"]
 
             return None
 
         except Exception as e:
             # print(f'e={e}')
-            _LOGGER.info(f'_only_send.recv.error:{e}')
+            _LOGGER.info(f"_send_receiver.error:{e}")
             return None
 
-    def _only_send(self, cmd: int, payload: dict) -> None:
+    async def _only_send(self, cmd: int, payload: dict) -> None:
         """
         send but not receiver
         :param cmd:
         :param payload:
         :return:
         """
+        if not await self._ensure_connected():
+            return
         try:
-            self._connect.send(self._get_package(cmd, payload))
-        except:
-            self._connect.send(self._get_package(cmd, payload))
+            self._writer.write(self._get_package(cmd, payload))
+            await self._writer.drain()
+        except Exception:
             try:
-                self.disconnect()
-                self._initSocket()
-                self._connect.send(self._get_package(cmd, payload))
-            except:
-                self.disconnect()
+                await self.disconnect()
+                await self._connect()
+                if self._writer:
+                    self._writer.write(self._get_package(cmd, payload))
+                    await self._writer.drain()
+            except Exception:
+                await self.disconnect()
 
-    def control(self, payload: dict) -> bool:
+    async def _send_receive_ack(self, cmd: int, payload: dict) -> bool:
+        """
+        send & receive ack (for commands that return simple ack)
+        :param cmd:
+        :param payload:
+        :return:
+        """
+        if not await self._ensure_connected():
+            return False
+        try:
+            self._writer.write(self._get_package(cmd, payload))
+            await self._writer.drain()
+        except Exception:
+            try:
+                await self.disconnect()
+                await self._connect()
+                if self._writer:
+                    self._writer.write(self._get_package(cmd, payload))
+                    await self._writer.drain()
+            except Exception:
+                pass
+        try:
+            i = 10
+            while i > 0:
+                try:
+                    res = await asyncio.wait_for(
+                        self._reader.readline(), timeout=self.timeout
+                    )
+                except asyncio.TimeoutError:
+                    i -= 1
+                    continue
+                i -= 1
+                # only allow same sn
+                if self._sn in res.decode("utf-8"):
+                    payload = json.loads(res.strip())
+                    if payload is None or len(payload) == 0:
+                        return False
+                    # For SET command, just check that we got a response
+                    return payload.get("res", -1) == 0
+            return False
+        except Exception as e:
+            _LOGGER.info(f"_send_receive_ack.error:{e}")
+            return False
+
+    async def control(self, payload: dict) -> bool:
         """
         control use dpid
         :param payload:
         :return:
         """
-        self._only_send(CMD_SET, payload)
-        return True
+        return await self._send_receive_ack(CMD_SET, payload)
 
-    def query(self) -> dict:
+    async def query(self) -> dict:
         """
         query device state
         :return:
         """
-        return self._send_receiver(CMD_QUERY, {})
+        return await self._send_receiver(CMD_QUERY, {})
