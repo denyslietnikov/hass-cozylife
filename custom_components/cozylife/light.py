@@ -450,6 +450,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             hs_color = colorutil.color_RGB_to_hs(r, g, b)
             payload["5"] = round(hs_color[0])
             payload["6"] = round(hs_color[1] * 10)
+            payload["2"] = 1  # RGB mode
             count += 1
 
         if count == 0:
@@ -457,6 +458,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             if effect is not None:
                 self._effect = effect
             if self._effect == "natural":
+                payload["2"] = 0  # White mode for natural
                 if CIRCADIAN_BRIGHTNESS:
                     brightness = self.calc_brightness()
                     payload["4"] = round(brightness / 255 * 1000)
@@ -473,6 +475,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     if transition is None:
                         transition = 5
             elif self._effect == "sleep":
+                payload["2"] = 1  # Effect mode
                 payload["4"] = 4
                 payload["3"] = 0
                 payload["4"] = 12
@@ -485,9 +488,11 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 # payload['5'] = round(16)
                 # payload['6'] = round(1000)
             elif self._effect == "study":
+                payload["2"] = 1  # Effect mode
                 payload["4"] = 1000
                 payload["3"] = 1000
             elif self._effect == "warm":
+                payload["2"] = 1  # Effect mode
                 payload["4"] = 1000
                 payload["3"] = 0
             elif self._effect == "chrismas":
