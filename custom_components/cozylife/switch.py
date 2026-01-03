@@ -25,12 +25,14 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
-SCAN_INTERVAL = timedelta(seconds=20)
+SCAN_INTERVAL = timedelta(seconds=10)
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.info(__name__)
 
-SCAN_INTERVAL = timedelta(seconds=10)
+# One lock per physical device (DPID '1' is a shared bitmask register),
+# so we must serialize query/control across both rockers.
+_DEVICE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 async def async_setup_platform(
@@ -70,15 +72,40 @@ async def async_setup_platform(
         switches.append(CozyLifeSwitch(client, hass, "wippe2", optimistic))
 
     async_add_devices(switches)
-    for switch in switches:
-        await switch._tcp_client._connect()
-        await switch._tcp_client._device_info()
+    # Connect each unique tcp_client only once (switches2 creates two entities sharing one client)
+    unique_clients = {}
+    for sw in switches:
+        unique_clients[id(sw._tcp_client)] = sw._tcp_client
+
+    for client in unique_clients.values():
+        await client._connect()
+        await client._device_info()
         await asyncio.sleep(0.01)
 
     async def async_update(now=None):
-        for switch in switches:
-            await switch._refresh_state()
+        # Refresh once per physical device and fan-out the same state to all its entities
+        client_to_state: dict[int, dict[str, Any] | None] = {}
+
+        # Query each unique client once
+        for client in unique_clients.values():
+            # Serialize query with the same lock used for control
+            device_key = (
+                getattr(client, "device_id", None)
+                or getattr(client, "_device_id", None)
+                or getattr(client, "ip", None)
+            )
+            lock = _DEVICE_LOCKS.setdefault(str(device_key), asyncio.Lock())
+            async with lock:
+                try:
+                    client_to_state[id(client)] = await client.query()
+                except Exception:
+                    _LOGGER.exception("Failed to query CozyLife device %s", device_key)
+                    client_to_state[id(client)] = None
             await asyncio.sleep(0.01)
+
+        # Apply state to all entities sharing the same client
+        for sw in switches:
+            sw._apply_state(client_to_state.get(id(sw._tcp_client)))
 
     if not optimistic:
         async_track_time_interval(hass, async_update, SCAN_INTERVAL)
@@ -100,7 +127,11 @@ class CozyLifeSwitch(SwitchEntity):
         self._name = tcp_client.device_id[-4:] + " " + wippe
         self._wippe = wippe  # Set the rocker attribute
         self._optimistic = optimistic
-        # self._refresh_state()  # Remove sync call in __init__
+        self._state: dict[str, Any] | None = None
+
+        # Shared lock across both rockers for the same physical device
+        device_key = tcp_client.device_id
+        self._lock = _DEVICE_LOCKS.setdefault(str(device_key), asyncio.Lock())
 
     @property
     def unique_id(self) -> str | None:
@@ -112,13 +143,22 @@ class CozyLifeSwitch(SwitchEntity):
             await self._refresh_state()
 
     async def _refresh_state(self):
-        self._state = await self._tcp_client.query()
-        # _LOGGER.info(f'_name={self._name},_state={self._state}')
-        if self._state:
-            if self._wippe == "wippe1":
-                self._attr_is_on = (self._state["1"] & 0x01) == 0x01
-            elif self._wippe == "wippe2":
-                self._attr_is_on = (self._state["1"] & 0x02) == 0x02
+        async with self._lock:
+            state = await self._tcp_client.query()
+        self._apply_state(state)
+
+    def _apply_state(self, state: dict[str, Any] | None) -> None:
+        """Apply a device state payload to this entity (no I/O)."""
+        self._state = state
+
+        if not self._state or "1" not in self._state:
+            return
+
+        reg = self._state["1"]
+        if self._wippe == "wippe1":
+            self._attr_is_on = (reg & 0x01) == 0x01
+        elif self._wippe == "wippe2":
+            self._attr_is_on = (reg & 0x02) == 0x02
 
     # ---------------------------------------------------------------------
     # Helper: safely obtain current value of register '1'
@@ -152,36 +192,50 @@ class CozyLifeSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
-        # Ensure we have the latest state to avoid NoneType errors
-        current = self._get_current_register_value()
-        _LOGGER.info(
-            "turn_on:%s  current=0x%02X  wippe=%s", kwargs, current, self._wippe
-        )
+        async with self._lock:
+            # Always refresh before read-modify-write on shared register '1'
+            state = await self._tcp_client.query()
+            self._apply_state(state)
+            current = self._get_current_register_value()
 
-        if self._wippe == "wippe1":
-            new_val = current | 0x01
-        else:  # wippe2
-            new_val = current | 0x02
+            _LOGGER.info(
+                "turn_on:%s  current=0x%02X  wippe=%s", kwargs, current, self._wippe
+            )
 
-        # Send the command
-        await self._tcp_client.control({"1": new_val})
+            if self._wippe == "wippe1":
+                new_val = current | 0x01
+            else:  # wippe2
+                new_val = current | 0x02
 
-        # Optimistically update the local state flag
+            await self._tcp_client.control({"1": new_val})
+
+            # Update local cached register to avoid stale next operations
+            if self._state is None:
+                self._state = {}
+            self._state["1"] = new_val
+
+        # Optimistically set state flag (actual bit will be re-applied on next refresh)
         self._attr_is_on = True
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
-        # Ensure we have the latest state to avoid NoneType errors
-        current = self._get_current_register_value()
-        _LOGGER.info("turn_off  current=0x%02X  wippe=%s", current, self._wippe)
+        async with self._lock:
+            # Always refresh before read-modify-write on shared register '1'
+            state = await self._tcp_client.query()
+            self._apply_state(state)
+            current = self._get_current_register_value()
 
-        if self._wippe == "wippe1":
-            new_val = current & ~0x01
-        else:  # wippe2
-            new_val = current & ~0x02
+            _LOGGER.info("turn_off  current=0x%02X  wippe=%s", current, self._wippe)
 
-        # Send the command
-        await self._tcp_client.control({"1": new_val})
+            if self._wippe == "wippe1":
+                new_val = current & ~0x01
+            else:  # wippe2
+                new_val = current & ~0x02
 
-        # Optimistically update the local state flag
+            await self._tcp_client.control({"1": new_val})
+
+            if self._state is None:
+                self._state = {}
+            self._state["1"] = new_val
+
         self._attr_is_on = False
