@@ -248,7 +248,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._min_mireds = colorutil.color_temperature_kelvin_to_mired(6500)
         self._max_mireds = colorutil.color_temperature_kelvin_to_mired(2700)
         self._miredsratio = (self._max_mireds - self._min_mireds) / 1000
-        self._attr_color_temp = 153
+        self._attr_color_temp = int(self._min_mireds)
         self._attr_hs_color = (0, 0)
         self._transitioning = 0
         self._attr_is_on = False
