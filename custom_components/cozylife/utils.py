@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from pathlib import Path
 
 import aiohttp
 
@@ -17,6 +18,35 @@ def get_sn() -> str:
 
 # cache get_pid_list result for many calls
 _CACHE_PID = []
+
+
+def _extract_pid_list(pid_list: dict) -> list:
+    """Extract product model list from a CozyLife API response."""
+    if pid_list.get("ret") is None or pid_list["ret"] != "1":
+        _LOGGER.info("get_pid_list.result is not as expected")
+        return []
+
+    info = pid_list.get("info")
+    if (
+        info is None
+        or not isinstance(info, dict)
+        or info.get("list") is None
+        or not isinstance(info["list"], list)
+    ):
+        _LOGGER.info("get_pid_list.result structure is not as expected")
+        return []
+
+    return info["list"]
+
+
+def _get_bundled_pid_list() -> list:
+    """Load bundled model metadata as an offline fallback."""
+    try:
+        model_path = Path(__file__).with_name("model.json")
+        return _extract_pid_list(json.loads(model_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as err:
+        _LOGGER.error("Error loading bundled model.json: %s", err)
+        return []
 
 
 async def get_pid_list(lang="en") -> list:
@@ -43,24 +73,14 @@ async def get_pid_list(lang="en") -> list:
                 pid_list = await response.json()
     except aiohttp.ClientError as e:
         _LOGGER.error(f"Error making API request: {e}")
-        return []
+        _CACHE_PID = _get_bundled_pid_list()
+        return _CACHE_PID
     except json.JSONDecodeError as e:
         _LOGGER.error(f"Error decoding JSON response: {e}")
-        return []
+        _CACHE_PID = _get_bundled_pid_list()
+        return _CACHE_PID
 
-    if pid_list.get("ret") is None or pid_list["ret"] != "1":
-        _LOGGER.info("get_pid_list.result is not as expected")
-        return []
-
-    info = pid_list.get("info")
-    if (
-        info is None
-        or not isinstance(info, dict)
-        or info.get("list") is None
-        or not isinstance(info["list"], list)
-    ):
-        _LOGGER.info("get_pid_list.result structure is not as expected")
-        return []
-
-    _CACHE_PID = info["list"]
+    _CACHE_PID = _extract_pid_list(pid_list)
+    if not _CACHE_PID:
+        _CACHE_PID = _get_bundled_pid_list()
     return _CACHE_PID

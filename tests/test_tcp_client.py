@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -111,6 +112,39 @@ async def test_tcp_client_control(mock_device):
     # Query to verify
     state = await client.query()
     assert state["1"] == 0
+
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_tcp_client_concurrent_requests_are_serialized(mock_device):
+    """Test concurrent calls share one stream safely."""
+    device, host, port = mock_device
+    client = tcp_client(host, timeout=1.0)
+    client._port = port
+
+    await client._connect()
+
+    results = await asyncio.gather(
+        client.control({"1": 1}),
+        client.query(),
+        client._ping(),
+        client.control({"1": 0}),
+        return_exceptions=True,
+    )
+
+    assert results[0] is True
+    assert isinstance(results[1], dict)
+    assert results[2] is None
+    assert results[3] is True
+    assert await client.query() == {
+        "1": 0,
+        "2": 0,
+        "3": 500,
+        "4": 500,
+        "5": 0,
+        "6": 0,
+    }
 
     await client.disconnect()
 
