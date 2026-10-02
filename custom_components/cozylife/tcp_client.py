@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import Any, Optional, Union
 
@@ -47,6 +48,15 @@ class tcp_client(object):
     def __init__(self, ip, timeout=3):
         self._ip = ip
         self.timeout = timeout
+        self._reader = None
+        self._writer = None
+        self._dpid = []
+        self._queried_dpids = []
+        self._heartbeat_enabled = True
+        self._last_response = 0.0
+        self._last_serial = 0
+        self.last_error = None
+        self._expected_device_id = None
         self._heartbeat_task = None
         self._io_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
@@ -59,7 +69,7 @@ class tcp_client(object):
         if writer:
             with suppress(Exception):
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.1)
 
     async def disconnect(self) -> None:
         """Close the connection and stop heartbeat."""
@@ -90,6 +100,7 @@ class tcp_client(object):
 
     async def _connect(self, start_heartbeat: bool = True) -> None:
         """Connect to the device."""
+        self._heartbeat_enabled = start_heartbeat
         async with self._connect_lock:
             if self.available:
                 if start_heartbeat:
@@ -98,11 +109,12 @@ class tcp_client(object):
 
             await self._close_writer()
             try:
-                self._reader, self._writer = await asyncio.open_connection(
-                    self._ip, self._port
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._ip, self._port), self.timeout
                 )
-            except Exception as err:
-                _LOGGER.info("_connect error, ip=%s: %s", self._ip, err)
+            except (OSError, TimeoutError) as err:
+                self.last_error = type(err).__name__
+                _LOGGER.debug("Connect failed for %s: %s", self._ip, err)
                 await self._close_writer()
             finally:
                 if start_heartbeat:
@@ -114,18 +126,31 @@ class tcp_client(object):
             return True
 
         _LOGGER.info("Ensuring connection for %s", self._ip)
-        await self._connect()
+        await self._connect(start_heartbeat=self._heartbeat_enabled)
         if self.available:
+            if self._expected_device_id:
+                info = await self._send_and_read(CMD_INFO, {})
+                if (
+                    not info
+                    or info.get("res") != 0
+                    or not isinstance(info.get("msg"), dict)
+                    or info["msg"].get("did") != self._expected_device_id
+                ):
+                    self.last_error = "Device identity mismatch"
+                    await self._close_writer()
+                    return False
             _LOGGER.info("Reconnected to %s", self._ip)
             return True
 
-        _LOGGER.warning("Failed to reconnect to %s", self._ip)
+        _LOGGER.debug("Failed to reconnect to %s", self._ip)
         return False
 
     async def _heartbeat(self) -> None:
         """Maintain connection and reconnect unavailable devices."""
         while True:
             await asyncio.sleep(30)
+            if time.monotonic() - self._last_response < 30:
+                continue
             try:
                 await self._ping()
             except asyncio.CancelledError:
@@ -136,70 +161,58 @@ class tcp_client(object):
                     self._ip,
                     err,
                 )
-                await self._connect()
 
-    async def _read_response_for_sn(self, sn: str) -> dict | None:
+    async def _read_response_for_sn(
+        self, sn: str, cmd: int | None = None
+    ) -> dict | None:
         """Read responses until one matching the expected serial is found."""
         if self._reader is None:
             return None
 
-        attempts = 10
-        while attempts > 0:
-            attempts -= 1
-            try:
-                response = await asyncio.wait_for(
-                    self._reader.readline(), timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                continue
-
+        while True:
+            response = await self._reader.readline()
             if not response:
-                return None
-
-            response_text = response.decode("utf-8", errors="ignore")
-            if sn not in response_text:
-                continue
-
+                raise ConnectionError("Device closed the connection")
             try:
-                return json.loads(response.strip())
-            except json.JSONDecodeError:
-                _LOGGER.info("Failed to parse response from %s", self._ip)
-                return None
-
-        return None
+                message = json.loads(response)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if (
+                isinstance(message, dict)
+                and str(message.get("sn")) == sn
+                and (cmd is None or message.get("cmd", cmd) == cmd)
+            ):
+                return message
 
     async def _send_and_read(self, cmd: int, payload: dict) -> dict | None:
         """Send a command and read the matching response."""
-        if not await self._ensure_connected():
-            return None
-        if self._writer is None:
-            return None
-
-        package = self._get_package(cmd, payload)
-        sn = self._sn
         try:
-            self._writer.write(package)
-            await self._writer.drain()
-        except Exception:
-            await self._close_writer()
-            if not await self._ensure_connected() or self._writer is None:
-                return None
-            package = self._get_package(cmd, payload)
-            sn = self._sn
-            try:
+            async with asyncio.timeout(self.timeout):
+                if not await self._ensure_connected() or self._writer is None:
+                    return None
+                package = self._get_package(cmd, payload)
                 self._writer.write(package)
                 await self._writer.drain()
-            except Exception:
-                await self._close_writer()
-                return None
-
-        return await self._read_response_for_sn(sn)
+                response = await self._read_response_for_sn(self._sn, cmd)
+                self._last_response = time.monotonic()
+                self.last_error = None
+                return response
+        except asyncio.CancelledError:
+            await self._close_writer()
+            raise
+        except (OSError, TimeoutError, ValueError) as err:
+            self.last_error = type(err).__name__
+            _LOGGER.debug("Command %s failed for %s: %s", cmd, self._ip, err)
+            await self._close_writer()
+            # A write may already have reached the device; never replay it blindly.
+            return None
 
     async def _ping(self) -> None:
         """Send a ping to check connection and clear the matching response."""
         async with self._io_lock:
             response = await self._send_and_read(CMD_INFO, {})
             if response is None or response.get("res") != 0:
+                await self._close_writer()
                 raise ConnectionError("Ping failed")
 
     @property
@@ -230,14 +243,23 @@ class tcp_client(object):
     @property
     def available(self) -> bool:
         """Return whether the TCP stream is currently open."""
-        return self._writer is not None and not self._writer.is_closing()
+        return (
+            self._writer is not None
+            and not self._writer.is_closing()
+            and self._reader is not None
+            and not self._reader.at_eof()
+        )
 
     async def _device_info(self) -> None:
         """Fetch and cache device model information."""
         async with self._io_lock:
             response = await self._send_and_read(CMD_INFO, {})
 
-        if response is None or not isinstance(response.get("msg"), dict):
+        if (
+            response is None
+            or response.get("res") != 0
+            or not isinstance(response.get("msg"), dict)
+        ):
             _LOGGER.info("_device_info.recv.error")
             return
 
@@ -248,13 +270,17 @@ class tcp_client(object):
 
         self._device_id = msg["did"]
         self._pid = msg["pid"]
+        if msg.get("dtp") is not None:
+            self._device_type_code = str(msg["dtp"])
 
         pid_list = await get_pid_list()
+        catalog_match = False
         for item in pid_list:
             match = False
             for model in item["device_model"]:
                 if model["device_product_id"] == self._pid:
                     match = True
+                    catalog_match = True
                     self._icon = model["icon"]
                     self._device_model_name = model["device_model_name"]
                     self._dpid = model["dpid"]
@@ -263,6 +289,25 @@ class tcp_client(object):
             if match:
                 self._device_type_code = item["device_type_code"]
                 break
+
+        if not self._dpid or self._device_type_code is None:
+            state = await self.query()
+            if state:
+                self._dpid = sorted(
+                    set(self._queried_dpids)
+                    | {int(key) for key in state if str(key).isdigit() and int(key) > 0}
+                )
+                # Type 02 can mean an RGB light, but catalogued motors also use it.
+                if (
+                    not catalog_match
+                    and self._device_type_code == "02"
+                    and ({3, 4} & set(self._dpid) or {5, 6} <= set(self._dpid))
+                ):
+                    self._device_type_code = "01"
+        if not self._device_model_name:
+            self._device_model_name = (
+                "Smart Light" if self._device_type_code == "01" else "Smart Switch"
+            )
 
         _LOGGER.debug(
             "Device discovered: did=%s pid=%s type=%s model=%s",
@@ -274,7 +319,8 @@ class tcp_client(object):
 
     def _get_package(self, cmd: int, payload: dict) -> bytes:
         """Build a protocol package."""
-        self._sn = get_sn()
+        self._last_serial = max(int(get_sn()), self._last_serial + 1)
+        self._sn = str(self._last_serial)
         if CMD_SET == cmd:
             message = {
                 "pv": 0,
@@ -291,7 +337,7 @@ class tcp_client(object):
                 "cmd": cmd,
                 "sn": self._sn,
                 "msg": {
-                    "attr": [0],
+                    "attr": [int(key) for key in payload] or [0],
                 },
             }
         elif CMD_INFO == cmd:
@@ -307,12 +353,21 @@ class tcp_client(object):
         async with self._io_lock:
             response = await self._send_and_read(cmd, payload)
 
-        if response is None or not isinstance(response.get("msg"), dict):
+        if (
+            response is None
+            or response.get("res") != 0
+            or not isinstance(response.get("msg"), dict)
+        ):
             return None
 
         data = response["msg"].get("data")
         if not isinstance(data, dict):
             return None
+        attributes = response["msg"].get("attr", [])
+        if cmd == CMD_QUERY and isinstance(attributes, list):
+            self._queried_dpids = [
+                int(key) for key in attributes if str(key).isdigit() and int(key) > 0
+            ]
 
         return data
 
@@ -340,6 +395,6 @@ class tcp_client(object):
         """Control device DPID values."""
         return await self._send_receive_ack(CMD_SET, payload)
 
-    async def query(self) -> dict:
+    async def query(self, dpids: list[int] | None = None) -> dict | None:
         """Query device state."""
-        return await self._send_receiver(CMD_QUERY, {})
+        return await self._send_receiver(CMD_QUERY, dict.fromkeys(dpids or []))

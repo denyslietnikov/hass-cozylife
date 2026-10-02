@@ -13,6 +13,8 @@ class MockCozyLifeDevice:
         self.host = host
         self.port = port
         self.server = None
+        self.writers = set()
+        self.requests = []
         self.state: Dict[str, Any] = {
             "1": 0,  # switch
             "2": 0,  # work mode
@@ -37,11 +39,12 @@ class MockCozyLifeDevice:
     ):
         """Handle incoming TCP connection."""
         addr = writer.get_extra_info("peername")
+        self.writers.add(writer)
         _LOGGER.info(f"Connection from {addr}")
 
         try:
             while True:
-                data = await reader.read(1024)
+                data = await reader.readline()
                 if not data:
                     break
 
@@ -50,6 +53,7 @@ class MockCozyLifeDevice:
 
                 try:
                     request = json.loads(message)
+                    self.requests.append(request)
                     response = await self.process_request(request)
                     response_str = json.dumps(response, separators=(",", ":")) + "\r\n"
                     writer.write(response_str.encode("utf-8"))
@@ -66,6 +70,7 @@ class MockCozyLifeDevice:
         finally:
             writer.close()
             await writer.wait_closed()
+            self.writers.discard(writer)
             _LOGGER.info(f"Connection closed for {addr}")
 
     async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -121,6 +126,9 @@ class MockCozyLifeDevice:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+            for writer in list(self.writers):
+                writer.close()
+                await writer.wait_closed()
             _LOGGER.info("Mock CozyLife device stopped")
 
     def set_state(self, key: str, value: Any):

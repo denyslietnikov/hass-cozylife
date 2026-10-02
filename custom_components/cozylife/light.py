@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import timedelta
 from typing import Any
 
@@ -23,12 +22,15 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EFFECT
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import color as colorutil
 
 from .const import (
@@ -42,6 +44,7 @@ from .const import (
     SAT,
     TEMP,
 )
+from .coordinator import CozyLifeCoordinator
 from .tcp_client import tcp_client
 
 LIGHT_SCHEMA = vol.Schema(
@@ -95,7 +98,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up CozyLife lights from a hub config entry."""
     entry_data = hass.data[DOMAIN][entry.entry_id]
-    clients = entry_data["clients"]
+    coordinators = entry_data["coordinators"]
     devices = entry_data["devices"]
 
     entities: list[LightEntity] = []
@@ -103,14 +106,14 @@ async def async_setup_entry(
         if dev.get(CONF_DEVICE_TYPE_CODE, LIGHT_TYPE_CODE) != LIGHT_TYPE_CODE:
             continue
 
-        client = clients.get(dev["did"])
-        if client is None:
+        coordinator = coordinators.get(dev["did"])
+        if coordinator is None:
             continue
 
         if "switch" in dev.get("dmn", "").lower():
-            entities.append(CozyLifeSwitchAsLight(client, hass))
+            entities.append(CozyLifeSwitchAsLight(coordinator, hass))
         else:
-            entities.append(CozyLifeLight(client, hass, SCENES))
+            entities.append(CozyLifeLight(coordinator, hass, SCENES))
 
     if entities:
         async_add_entities(entities)
@@ -156,16 +159,18 @@ async def async_setup_platform(
         )
 
 
-class CozyLifeSwitchAsLight(LightEntity):
+class CozyLifeSwitchAsLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity):
     """Switch-like CozyLife device exposed as a light."""
 
     _attr_color_mode = ColorMode.ONOFF
     _attr_supported_color_modes = {ColorMode.ONOFF}
-    _attr_is_on = True
+    _attr_is_on = None
     _unrecorded_attributes = frozenset({"brightness", "color_temp_kelvin"})
 
-    def __init__(self, tcp_client: tcp_client, hass) -> None:
+    def __init__(self, coordinator: CozyLifeCoordinator, hass) -> None:
         """Initialize."""
+        super().__init__(coordinator)
+        tcp_client = coordinator.client
         self.hass = hass
         self._tcp_client = tcp_client
         self._unique_id = tcp_client.device_id
@@ -192,35 +197,39 @@ class CozyLifeSwitchAsLight(LightEntity):
         """Return entity name."""
         return f"cozylife:{self._name}"
 
-    @property
-    def available(self) -> bool:
-        """Return whether the device is available."""
-        return self._tcp_client.available
-
     async def async_added_to_hass(self) -> None:
         """Fetch initial state when entity is added."""
         await super().async_added_to_hass()
-        await self._refresh_state()
+        self._apply_state(self.coordinator.data)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._apply_state(self.coordinator.data)
+        super()._handle_coordinator_update()
 
     async def async_update(self) -> None:
         """Poll device state."""
-        await self._refresh_state()
+        await self.coordinator.async_request_refresh()
+        self._apply_state(self.coordinator.data)
 
     async def _refresh_state(self) -> None:
         """Query device and update state attributes."""
-        self._state = await self._tcp_client.query()
+        await self.async_update()
+
+    def _apply_state(self, state: dict | None) -> None:
+        self._state = state
         if self._state:
             self._attr_is_on = self._state.get("1", 0) > 0
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
-        self._attr_is_on = True
-        await self._tcp_client.control({"1": 1})
+        await self.coordinator.async_control({"1": 1})
+        self._apply_state(self.coordinator.data)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
-        self._attr_is_on = False
-        await self._tcp_client.control({"1": 0})
+        await self.coordinator.async_control({"1": 0})
+        self._apply_state(self.coordinator.data)
 
 
 class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
@@ -233,10 +242,17 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     _attr_supported_features = LightEntityFeature.EFFECT | LightEntityFeature.TRANSITION
     _unrecorded_attributes = frozenset({"brightness", "color_temp_kelvin"})
 
-    def __init__(self, tcp_client: tcp_client, hass, scenes: list[str]) -> None:
+    def __init__(
+        self, coordinator: CozyLifeCoordinator, hass, scenes: list[str]
+    ) -> None:
         """Initialize."""
-        super().__init__(tcp_client, hass)
-        self._scenes = scenes
+        super().__init__(coordinator, hass)
+        tcp_client = coordinator.client
+        self._scenes = list(scenes)
+        if not {"7", "8"} <= _dpid_set(tcp_client):
+            self._scenes = [scene for scene in scenes if scene != "chrismas"]
+        self._transition_task = None
+        self._command_lock = asyncio.Lock()
         self._effect = "manual"
         self._cl = None
         self._max_brightness = 255
@@ -262,6 +278,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             supported = {ColorMode.ONOFF}
 
         self._attr_supported_color_modes = supported
+        if BRIGHT not in dpid:
+            self._attr_supported_features &= ~LightEntityFeature.TRANSITION
         if ColorMode.HS in supported:
             self._attr_color_mode = ColorMode.HS
         elif ColorMode.COLOR_TEMP in supported:
@@ -284,7 +302,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     @property
     def assumed_state(self) -> bool:
         """Return whether the state is assumed."""
-        return True
+        return False
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -306,6 +324,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     def calc_color_temp_kelvin(self) -> int | None:
         """Calculate circadian color temperature in Kelvin."""
+        if not CIRCADIAN_BRIGHTNESS:
+            return None
         if self._cl is None:
             self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
             if self._cl is None:
@@ -314,6 +334,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     def calc_brightness(self) -> int | None:
         """Calculate circadian brightness."""
+        if not CIRCADIAN_BRIGHTNESS:
+            return None
         if self._cl is None:
             self._cl = self.hass.data.get(DATA_CIRCADIAN_LIGHTING)
             if self._cl is None:
@@ -332,284 +354,208 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         """Restore effect and fetch initial state."""
         await super().async_added_to_hass()
         last_state = await self.async_get_last_state()
-        if last_state and "last_effect" in last_state.attributes:
+        if last_state and last_state.attributes.get("last_effect") in self.effect_list:
             self._effect = last_state.attributes["last_effect"]
-        await self._refresh_state()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_natural_update, SCAN_INTERVAL
+            )
+        )
 
     async def async_set_effect(self, effect: str) -> None:
         """Set effect, applying it immediately if the light is on."""
-        self._effect = effect
+        if effect not in self.effect_list:
+            raise HomeAssistantError("Unsupported CozyLife effect")
         if self._attr_is_on:
             await self.async_turn_on(effect=effect)
-
-    async def async_update(self) -> None:
-        """Poll device state, preserving natural effect behavior."""
-        if self._attr_is_on and self._effect == "natural":
-            await self.async_turn_on(effect="natural")
         else:
-            await self._refresh_state()
+            self._effect = effect
+            self.async_write_ha_state()
 
-    async def _refresh_state(self) -> None:
-        """Query device and set attributes."""
-        self._state = await self._tcp_client.query()
-        if not self._state:
-            return
+    async def _async_natural_update(self, _now) -> None:
+        """Keep the optional circadian effect independent from state polling."""
+        if self._effect == "natural" and not self._transition_task:
+            await self.coordinator.async_refresh()
+            self._apply_state(self.coordinator.data)
+            if not self.available or not self.is_on:
+                return
+            try:
+                await self.async_turn_on(effect="natural")
+            except HomeAssistantError:
+                _LOGGER.debug("Could not update the natural effect", exc_info=True)
 
-        self._attr_is_on = self._state.get("1", 0) > 0
-
-        if "4" in self._state:
-            self._attr_brightness = int(self._state["4"] / 1000 * 255)
-
-        mode = self._state.get("2", 0)
-        if mode == 0:
-            if (
-                "3" in self._state
-                and ColorMode.COLOR_TEMP in self._attr_supported_color_modes
-            ):
-                color_temp = self._state["3"]
-                if color_temp < 60000:
-                    self._attr_color_mode = ColorMode.COLOR_TEMP
-                    self._attr_color_temp_kelvin = self._kelvin_from_device_temp(
-                        color_temp
-                    )
-        elif mode == 1:
-            if (
-                "5" in self._state
-                and "6" in self._state
-                and ColorMode.HS in self._attr_supported_color_modes
-            ):
-                color = self._state["5"]
-                if color < 60000:
-                    self._attr_color_mode = ColorMode.HS
-                    r, g, b = colorutil.color_hs_to_RGB(
-                        round(self._state["5"]), round(self._state["6"] / 10)
-                    )
-                    self._attr_hs_color = colorutil.color_RGB_to_hs(r, g, b)
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the entity on."""
-        brightness = kwargs.get(ATTR_BRIGHTNESS)
-        colortemp_kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
-        hs_color = kwargs.get(ATTR_HS_COLOR)
-        transition = kwargs.get(ATTR_TRANSITION)
-        effect = kwargs.get(ATTR_EFFECT)
-
-        original_kelvin = self._attr_color_temp_kelvin or DEFAULT_MAX_KELVIN
-        original_hs = self._attr_hs_color or (0, 0)
-        original_brightness = self._attr_brightness if self._attr_is_on else 0
-
-        self._attr_is_on = True
-        self.async_write_ha_state()
-
-        payload = {"1": 255, "2": 0}
-        changed = 0
-
-        if brightness is not None:
-            self._effect = "manual"
-            payload["4"] = round(brightness / 255 * 1000)
-            self._attr_brightness = brightness
-            changed += 1
-
+    async def async_will_remove_from_hass(self) -> None:
         if (
-            colortemp_kelvin is not None
-            and ColorMode.COLOR_TEMP in self._attr_supported_color_modes
+            self._transition_task
+            and self._transition_task is not asyncio.current_task()
         ):
-            self._effect = "manual"
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-            self._attr_color_temp_kelvin = colortemp_kelvin
-            payload["3"] = self._device_temp_from_kelvin(colortemp_kelvin)
-            changed += 1
+            self._transition_task.cancel()
+            try:
+                await self._transition_task
+            except asyncio.CancelledError:
+                pass
+        await super().async_will_remove_from_hass()
 
-        if hs_color is not None and ColorMode.HS in self._attr_supported_color_modes:
-            self._effect = "manual"
-            self._attr_color_mode = ColorMode.HS
-            self._attr_hs_color = hs_color
-            r, g, b = colorutil.color_hs_to_RGB(*hs_color)
-            normalized_hs = colorutil.color_RGB_to_hs(r, g, b)
-            payload["5"] = round(normalized_hs[0])
-            payload["6"] = round(normalized_hs[1] * 10)
-            changed += 1
-
-        if changed == 0:
-            if effect is not None:
-                self._effect = effect
-
-            if self._effect == "natural":
-                payload["2"] = 0
-                if CIRCADIAN_BRIGHTNESS:
-                    brightness = self.calc_brightness()
-                    colortemp_kelvin = self.calc_color_temp_kelvin()
-                    if brightness is not None:
-                        payload["4"] = round(brightness / 255 * 1000)
-                        self._attr_brightness = brightness
-                    if (
-                        colortemp_kelvin is not None
-                        and ColorMode.COLOR_TEMP in self._attr_supported_color_modes
-                    ):
-                        self._attr_color_mode = ColorMode.COLOR_TEMP
-                        self._attr_color_temp_kelvin = colortemp_kelvin
-                        payload["3"] = self._device_temp_from_kelvin(colortemp_kelvin)
-                    if self._transitioning != 0:
-                        return
-                    if transition is None:
-                        transition = 5
-            elif self._effect == "sleep":
-                payload["4"] = 12
-                payload["3"] = 0
+    def _apply_state(self, state: dict | None) -> None:
+        """Apply shared, acknowledged or polled device state."""
+        super()._apply_state(state)
+        if not state:
+            return
+        if isinstance(state.get("4"), (int, float)):
+            self._attr_brightness = max(0, min(255, round(state["4"] / 1000 * 255)))
+        if (
+            state.get("2", 0) == 0
+            and ColorMode.COLOR_TEMP in self.supported_color_modes
+        ):
+            if isinstance(state.get("3"), (int, float)) and 0 <= state["3"] <= 1000:
                 self._attr_color_mode = ColorMode.COLOR_TEMP
-                self._attr_brightness = round(12 / 1000 * 255)
-                self._attr_color_temp_kelvin = DEFAULT_MIN_KELVIN
-            elif self._effect == "study":
-                payload["4"] = 1000
-                payload["3"] = 1000
-                self._attr_color_mode = ColorMode.COLOR_TEMP
-                self._attr_brightness = 255
-                self._attr_color_temp_kelvin = DEFAULT_MAX_KELVIN
-            elif self._effect == "warm":
-                payload["4"] = 1000
-                payload["3"] = 0
-                self._attr_color_mode = ColorMode.COLOR_TEMP
-                self._attr_brightness = 255
-                self._attr_color_temp_kelvin = DEFAULT_MIN_KELVIN
-            elif self._effect == "chrismas":
-                payload["2"] = 1
-                payload["4"] = 1000
-                payload["8"] = 500
-                payload["7"] = (
-                    "03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B4"
-                    "03E8FFFF010E03E8FFFF002603E8FFFF"
+                self._attr_color_temp_kelvin = self._kelvin_from_device_temp(state["3"])
+        elif ColorMode.HS in self.supported_color_modes:
+            if isinstance(state.get("5"), (int, float)) and isinstance(
+                state.get("6"), (int, float)
+            ):
+                self._attr_color_mode = ColorMode.HS
+                self._attr_hs_color = (
+                    max(0, min(360, state["5"])),
+                    max(0, min(100, state["6"] / 10)),
                 )
 
-        if hs_color is not None or self._attr_color_mode == ColorMode.HS:
-            payload["2"] = 1
-        elif self._effect == "chrismas":
-            payload["2"] = 1
-        else:
-            payload["2"] = 0
+    def _white_payload(self, kelvin: int) -> dict:
+        if ColorMode.COLOR_TEMP in self.supported_color_modes:
+            return {"2": 0, "3": self._device_temp_from_kelvin(kelvin)}
+        if ColorMode.HS in self.supported_color_modes:
+            hue, saturation = colorutil.color_temperature_to_hs(kelvin)
+            return {"2": 1, "5": round(hue), "6": round(saturation * 10)}
+        return {}
 
-        self._transitioning = 0
-        if transition:
-            await self._transition_on(
-                payload,
-                transition,
-                original_brightness or 0,
-                original_kelvin,
-                original_hs,
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Build a target without changing HA state before acknowledgement."""
+        dpids = _dpid_set(self._tcp_client)
+        payload = {"1": 255}
+        if "2" in dpids:
+            payload["2"] = 1 if self.color_mode == ColorMode.HS else 0
+        effect = kwargs.get(ATTR_EFFECT, self._effect)
+        if effect not in self.effect_list:
+            raise HomeAssistantError("Unsupported CozyLife effect")
+        changed = False
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        if brightness is not None and BRIGHT in dpids:
+            payload["4"] = round(max(0, min(255, brightness)) / 255 * 1000)
+            changed = True
+        kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
+        if kelvin is not None:
+            if ColorMode.COLOR_TEMP not in self.supported_color_modes:
+                raise HomeAssistantError(
+                    "Color temperature is not supported by this device"
+                )
+            payload.update(self._white_payload(kelvin))
+            changed = True
+        hs = kwargs.get(ATTR_HS_COLOR)
+        if hs is not None:
+            if ColorMode.HS not in self.supported_color_modes:
+                raise HomeAssistantError("HS color is not supported by this device")
+            payload.update({"2": 1, "5": round(hs[0]), "6": round(hs[1] * 10)})
+            changed = True
+        transition = kwargs.get(ATTR_TRANSITION, 0)
+        if changed:
+            effect = "manual"
+        elif effect in ("sleep", "warm", "study"):
+            if BRIGHT in dpids:
+                payload["4"] = 12 if effect == "sleep" else 1000
+            payload.update(
+                self._white_payload(
+                    DEFAULT_MAX_KELVIN if effect == "study" else DEFAULT_MIN_KELVIN
+                )
             )
-        else:
-            await self._tcp_client.control(payload)
+        elif effect == "natural":
+            brightness = self.calc_brightness()
+            kelvin = self.calc_color_temp_kelvin()
+            if brightness is not None and BRIGHT in dpids:
+                payload["4"] = round(brightness / 255 * 1000)
+            if kelvin is not None:
+                payload.update(self._white_payload(kelvin))
+            transition = kwargs.get(ATTR_TRANSITION, 5 if CIRCADIAN_BRIGHTNESS else 0)
+        elif effect == "chrismas":
+            payload.update(
+                {
+                    "2": 1,
+                    "4": 1000,
+                    "8": 500,
+                    "7": "03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF010E03E8FFFF002603E8FFFF",
+                }
+            )
+            transition = 0
+        await self._async_run_command(payload, transition, effect)
 
-        self._transitioning = 0
-
-    async def _transition_on(
+    async def _async_run_command(
         self,
         payload: dict,
         transition: float,
-        original_brightness: int,
-        original_kelvin: int,
-        original_hs: tuple[float, float],
+        effect: str | None = None,
+        turn_off: bool = False,
     ) -> None:
-        """Apply a smooth transition to the target payload."""
-        self._transitioning = time.time()
-        now = self._transitioning
-
-        if self._effect == "chrismas":
-            await self._tcp_client.control(payload)
-            return
-
-        payloadtemp = {"1": 255, "2": payload.get("2", 0)}
-        p4steps = 0
-        p4i = round(original_brightness / 255 * 1000)
-        p4f = payload.get("4", p4i)
-        if "4" in payload:
-            p4steps = abs(round((p4i - p4f) / 4))
-
-        if self._attr_color_mode == ColorMode.COLOR_TEMP:
-            p3i = self._device_temp_from_kelvin(original_kelvin)
-            p3f = payload.get("3", p3i)
-            p3steps = abs(round((p3i - p3f) / 4)) if "3" in payload else 0
-            steps = max(p3steps, p4steps)
-            if steps <= 0:
-                return
-            stepseconds = max(transition / steps, MIN_INTERVAL)
-            steps = max(1, round(transition / stepseconds))
-
-            for step in range(1, steps + 1):
-                if "4" in payload:
-                    payloadtemp["4"] = round(p4i + (p4f - p4i) * step / steps)
-                if "3" in payload:
-                    payloadtemp["3"] = round(p3i + (p3f - p3i) * step / steps)
-                if now != self._transitioning:
-                    return
-                await self._tcp_client.control(payloadtemp)
-                if step < steps:
-                    await asyncio.sleep(stepseconds)
-
-        elif self._attr_color_mode == ColorMode.HS:
-            p5i = original_hs[0]
-            p6i = original_hs[1] * 10
-            p5f = payload.get("5", p5i)
-            p6f = payload.get("6", p6i)
-            p5steps = abs(round((p5i - p5f) / 3)) if "5" in payload else 0
-            p6steps = abs(round((p6i - p6f) / 10)) if "6" in payload else 0
-            steps = max(p4steps, p5steps, p6steps)
-            if steps <= 0:
-                return
-            stepseconds = transition / steps
-            if stepseconds < MIN_INTERVAL:
-                stepseconds = MIN_INTERVAL
-                steps = max(1, round(transition / stepseconds))
-
-            for step in range(1, steps + 1):
-                if "4" in payload:
-                    payloadtemp["4"] = round(p4i + (p4f - p4i) * step / steps)
-                if "5" in payload:
-                    payloadtemp["5"] = round(p5i + (p5f - p5i) * step / steps)
-                    payloadtemp["6"] = round(p6i + (p6f - p6i) * step / steps)
-                if now != self._transitioning:
-                    return
-                await self._tcp_client.control(payloadtemp)
-                if step < steps:
-                    await asyncio.sleep(stepseconds)
-        else:
-            await self._tcp_client.control(payload)
+        """Cancel an older fade and interpolate against a monotonic deadline."""
+        task = asyncio.current_task()
+        previous = self._transition_task
+        self._transition_task = task
+        try:
+            if previous and previous is not task:
+                previous.cancel()
+                try:
+                    await previous
+                except asyncio.CancelledError:
+                    if task.cancelling():
+                        raise
+            async with self._command_lock:
+                self._transitioning = max(0, transition or 0)
+                state = dict(self.coordinator.data or {})
+                if not state.get("1") and "4" in payload:
+                    state["4"] = 0
+                fields = {
+                    key: state[key]
+                    for key in ("3", "4", "5", "6")
+                    if key in payload
+                    and isinstance(state.get(key), (int, float))
+                    and state[key] != payload[key]
+                }
+                if self._transitioning and fields:
+                    loop = asyncio.get_running_loop()
+                    start = loop.time()
+                    deadline = start + self._transitioning
+                    while loop.time() < deadline:
+                        fraction = min(1, (loop.time() - start) / self._transitioning)
+                        frame = {
+                            **payload,
+                            **{
+                                key: round(value + (payload[key] - value) * fraction)
+                                for key, value in fields.items()
+                            },
+                        }
+                        await self.coordinator.async_control(frame)
+                        await asyncio.sleep(
+                            max(0, min(MIN_INTERVAL, deadline - loop.time()))
+                        )
+                # Always send the final command, even for a zero-distance fade.
+                await self.coordinator.async_control(payload)
+                if turn_off:
+                    await self.coordinator.async_control({"1": 0})
+                if effect is not None:
+                    self._effect = effect
+                self._apply_state(self.coordinator.data)
+        finally:
+            if self._transition_task is task:
+                self._transition_task = None
+                self._transitioning = 0
+                if self.entity_id:
+                    self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the entity off."""
-        self._transitioning = 0
-        self._attr_is_on = False
-        self.async_write_ha_state()
-
-        transition = kwargs.get(ATTR_TRANSITION)
-        original_brightness = self._attr_brightness or 0
-        if self._effect == "natural" and transition is None:
-            transition = 5
-
-        if not transition:
-            await super().async_turn_off()
-            return
-
-        self._transitioning = time.time()
-        now = self._transitioning
-        payloadtemp = {"1": 255, "2": 0}
-        p4i = round(original_brightness / 255 * 1000)
-        p4f = 0
-        steps = abs(round((p4i - p4f) / 4))
-        if steps <= 0:
-            self._transitioning = 0
-            await super().async_turn_off()
-            return
-
-        stepseconds = max(transition / steps, MIN_INTERVAL)
-        steps = max(1, round(transition / stepseconds))
-        for step in range(1, steps + 1):
-            payloadtemp["4"] = round(p4i + (p4f - p4i) * step / steps)
-            if now != self._transitioning:
-                return
-            await self._tcp_client.control(payloadtemp)
-            if step < steps:
-                await asyncio.sleep(stepseconds)
-            else:
-                await super().async_turn_off()
-
-        self._transitioning = 0
+        """Fade brightness in the current color mode before switching off."""
+        transition = kwargs.get(ATTR_TRANSITION, 5 if self._effect == "natural" else 0)
+        if transition and BRIGHT in _dpid_set(self._tcp_client):
+            payload = {"1": 255, "4": 0}
+            if "2" in _dpid_set(self._tcp_client):
+                payload["2"] = 1 if self.color_mode == ColorMode.HS else 0
+            await self._async_run_command(payload, transition, turn_off=True)
+        else:
+            await self._async_run_command({"1": 0}, 0)

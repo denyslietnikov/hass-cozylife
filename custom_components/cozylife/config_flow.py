@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from ipaddress import IPv4Address, ip_address
+from ipaddress import IPv4Address
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigFlow, OptionsFlowWithReload
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     CONF_DEVICE_TYPE_CODE,
     CONF_DEVICES,
+    CONF_LIGHT_INTERVAL,
     CONF_SUBNET,
+    CONF_SWITCH_INTERVAL,
+    DEFAULT_LIGHT_INTERVAL,
+    DEFAULT_SWITCH_INTERVAL,
     DOMAIN,
     SUPPORT_DEVICE_CATEGORY,
+    SWITCH_TYPE_CODE,
 )
 from .tcp_client import tcp_client
 
@@ -38,15 +44,44 @@ def _get_subnet(ip: str) -> str:
 
 def _merge_device(existing: dict, incoming: dict) -> dict:
     """Merge imported metadata for the same physical device."""
-    merged = {**existing, **incoming}
+    merged = {
+        **existing,
+        **{key: value for key, value in incoming.items() if value is not None},
+    }
+    if existing.get("name"):
+        merged["name"] = existing["name"]
+    merged["dpid"] = sorted(
+        {int(dpid) for dpid in existing.get("dpid", []) + incoming.get("dpid", [])}
+    )
     merged["rockers"] = max(existing.get("rockers", 1), incoming.get("rockers", 1))
     return merged
+
+
+def _validate_range(
+    start_ip: str, end_ip: str, subnet: str | None = None
+) -> str | None:
+    try:
+        start, end = IPv4Address(start_ip), IPv4Address(end_ip)
+    except ValueError:
+        return "invalid_ip"
+    if _get_subnet(start_ip) != _get_subnet(end_ip) or (
+        subnet and _get_subnet(start_ip) != subnet
+    ):
+        return "different_subnet"
+    if int(start) > int(end):
+        return "invalid_range"
+    return None
 
 
 class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for CozyLife."""
 
     VERSION = 2
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return CozyLifeOptionsFlow()
 
     @staticmethod
     async def _probe_device(ip: str) -> dict | None:
@@ -68,7 +103,7 @@ class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
                 "dmn": client.device_model_name,
                 "dpid": client.dpid,
                 CONF_DEVICE_TYPE_CODE: client.device_type_code,
-                "rockers": 1,
+                "rockers": 2 if client._pid == "e5aHVS" else 1,
             }
         except Exception:
             _LOGGER.exception("Error probing CozyLife device at %s", ip)
@@ -108,8 +143,8 @@ class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
             end_ip = user_input["end_ip"].strip()
 
             try:
-                start_addr = ip_address(start_ip)
-                end_addr = ip_address(end_ip)
+                start_addr = IPv4Address(start_ip)
+                end_addr = IPv4Address(end_ip)
             except ValueError:
                 errors["base"] = "invalid_ip"
                 return self.async_show_form(
@@ -208,4 +243,153 @@ class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
                 "end_ip": f"{subnet}.254",
                 CONF_DEVICES: [import_data],
             },
+        )
+
+
+class CozyLifeOptionsFlow(OptionsFlowWithReload):
+    """Manage polling and hub devices without recreating their identities."""
+
+    async def async_step_init(self, user_input=None):
+        return self.async_show_menu(
+            step_id="init", menu_options=["settings", "rescan", "device"]
+        )
+
+    async def async_step_settings(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            try:
+                values = {
+                    key: vol.All(vol.Coerce(int), vol.Range(min=1, max=300))(
+                        user_input[key]
+                    )
+                    for key in (CONF_SWITCH_INTERVAL, CONF_LIGHT_INTERVAL)
+                }
+            except (vol.Invalid, KeyError, TypeError):
+                errors["base"] = "invalid_interval"
+            else:
+                return self.async_create_entry(
+                    title="", data={**self.config_entry.options, **values}
+                )
+        return self.async_show_form(
+            step_id="settings",
+            errors=errors,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SWITCH_INTERVAL,
+                        default=self.config_entry.options.get(
+                            CONF_SWITCH_INTERVAL, DEFAULT_SWITCH_INTERVAL
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+                    vol.Required(
+                        CONF_LIGHT_INTERVAL,
+                        default=self.config_entry.options.get(
+                            CONF_LIGHT_INTERVAL, DEFAULT_LIGHT_INTERVAL
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
+                }
+            ),
+        )
+
+    def _save_devices(self, devices: list[dict], **updates):
+        data = {**self.config_entry.data, **updates, CONF_DEVICES: devices}
+        if data != dict(self.config_entry.data):
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            )
+        # Options did not change, so OptionsFlowWithReload will not reload twice.
+        return self.async_create_entry(title="", data=dict(self.config_entry.options))
+
+    async def async_step_rescan(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            start, end = user_input["start_ip"].strip(), user_input["end_ip"].strip()
+            error = _validate_range(start, end, self.config_entry.data[CONF_SUBNET])
+            if error:
+                errors["base"] = error
+            else:
+                discovered = await CozyLifeConfigFlow._scan_range(start, end)
+                if not discovered:
+                    errors["base"] = "cannot_connect"
+                else:
+                    devices = {
+                        device["did"]: dict(device)
+                        for device in self.config_entry.data[CONF_DEVICES]
+                    }
+                    for device in discovered:
+                        devices[device["did"]] = _merge_device(
+                            devices.get(device["did"], {}), device
+                        )
+                    return self._save_devices(
+                        list(devices.values()), start_ip=start, end_ip=end
+                    )
+        return self.async_show_form(
+            step_id="rescan",
+            errors=errors,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "start_ip", default=self.config_entry.data["start_ip"]
+                    ): str,
+                    vol.Required(
+                        "end_ip", default=self.config_entry.data["end_ip"]
+                    ): str,
+                }
+            ),
+        )
+
+    async def async_step_device(self, user_input=None):
+        devices = self.config_entry.data[CONF_DEVICES]
+        if user_input is not None:
+            self._device_id = user_input["did"]
+            return await self.async_step_edit_device()
+        return self.async_show_form(
+            step_id="device",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("did"): vol.In(
+                        {
+                            device[
+                                "did"
+                            ]: f"{device.get('dmn', device['did'])} ({device['ip']})"
+                            for device in devices
+                        }
+                    )
+                }
+            ),
+        )
+
+    async def async_step_edit_device(self, user_input=None):
+        devices = [dict(device) for device in self.config_entry.data[CONF_DEVICES]]
+        device = next(device for device in devices if device["did"] == self._device_id)
+        errors = {}
+        if user_input is not None:
+            ip = user_input["ip"].strip()
+            error = _validate_range(ip, ip, self.config_entry.data[CONF_SUBNET])
+            if error:
+                errors["base"] = error
+            elif any(
+                other["did"] != self._device_id and other["ip"] == ip
+                for other in devices
+            ):
+                errors["base"] = "duplicate_ip"
+            else:
+                try:
+                    if device.get(CONF_DEVICE_TYPE_CODE) == SWITCH_TYPE_CODE:
+                        device["rockers"] = vol.All(
+                            vol.Coerce(int), vol.Range(min=1, max=8)
+                        )(user_input.get("rockers", device.get("rockers", 1)))
+                except vol.Invalid:
+                    errors["base"] = "invalid_rockers"
+                else:
+                    device["ip"] = ip
+                    return self._save_devices(devices)
+        schema = {vol.Required("ip", default=device["ip"]): str}
+        if device.get(CONF_DEVICE_TYPE_CODE) == SWITCH_TYPE_CODE:
+            schema[vol.Required("rockers", default=device.get("rockers", 1))] = vol.All(
+                vol.Coerce(int), vol.Range(min=1, max=8)
+            )
+        return self.async_show_form(
+            step_id="edit_device", data_schema=vol.Schema(schema), errors=errors
         )

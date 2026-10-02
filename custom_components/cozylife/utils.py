@@ -1,9 +1,8 @@
+import asyncio
 import json
 import logging
 import time
 from pathlib import Path
-
-import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ def _extract_pid_list(pid_list: dict) -> list:
 
 
 def _get_bundled_pid_list() -> list:
-    """Load bundled model metadata as an offline fallback."""
+    """Load model metadata without requiring the vendor cloud."""
     try:
         model_path = Path(__file__).with_name("model.json")
         return _extract_pid_list(json.loads(model_path.read_text(encoding="utf-8")))
@@ -50,37 +49,36 @@ def _get_bundled_pid_list() -> list:
 
 
 async def get_pid_list(lang="en") -> list:
-    """
-    http://doc.doit/project-12/doc-95/
-    :param lang:
-    :return:
-    """
+    """Cache the offline catalog; keep the language argument for CLI compatibility."""
     global _CACHE_PID
     if len(_CACHE_PID) != 0:
         return _CACHE_PID
 
-    domain = "api-us.doiting.com"
-    protocol = "http"
-    url_prefix = protocol + "://" + domain
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url_prefix + "/api/device_product/model",
-                params={"lang": lang},
-                timeout=aiohttp.ClientTimeout(total=3),
-            ) as response:
-                response.raise_for_status()
-                pid_list = await response.json()
-    except aiohttp.ClientError as e:
-        _LOGGER.error(f"Error making API request: {e}")
-        _CACHE_PID = _get_bundled_pid_list()
-        return _CACHE_PID
-    except json.JSONDecodeError as e:
-        _LOGGER.error(f"Error decoding JSON response: {e}")
-        _CACHE_PID = _get_bundled_pid_list()
-        return _CACHE_PID
-
-    _CACHE_PID = _extract_pid_list(pid_list)
-    if not _CACHE_PID:
-        _CACHE_PID = _get_bundled_pid_list()
+    _CACHE_PID = await asyncio.to_thread(_get_bundled_pid_list)
+    _CACHE_PID.extend(
+        [
+            {
+                "device_type_code": "00",
+                "device_model": [
+                    {
+                        "device_product_id": "e5aHVS",
+                        "device_model_name": "Smart switch",
+                        "icon": None,
+                        "dpid": [1, 2, 3, 4, 5, 18, 19, 20],
+                    }
+                ],
+            },
+            {
+                "device_type_code": "01",
+                "device_model": [
+                    {
+                        "device_product_id": "o0mmpn",
+                        "device_model_name": "Smart led Strip",
+                        "icon": None,
+                        "dpid": [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14],
+                    }
+                ],
+            },
+        ]
+    )
     return _CACHE_PID

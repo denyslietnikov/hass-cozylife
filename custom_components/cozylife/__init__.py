@@ -27,10 +27,15 @@ except ModuleNotFoundError as err:
 from .const import (
     CONF_DEVICE_TYPE_CODE,
     CONF_DEVICES,
+    CONF_LIGHT_INTERVAL,
     CONF_SUBNET,
+    CONF_SWITCH_INTERVAL,
+    DEFAULT_LIGHT_INTERVAL,
+    DEFAULT_SWITCH_INTERVAL,
     DOMAIN,
     LIGHT_TYPE_CODE,
     PLATFORMS,
+    SWITCH_TYPE_CODE,
 )
 from .tcp_client import tcp_client
 
@@ -179,23 +184,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return True
 
     clients: dict[str, tcp_client] = {}
+    from .coordinator import CozyLifeCoordinator
+
+    coordinators = {}
     for dev in devices:
         client = tcp_client(dev["ip"])
         client._device_id = dev["did"]
+        client._expected_device_id = dev["did"]
         client._pid = dev.get("pid", "p93sfg")
         client._dpid = dev.get("dpid", [1])
         client._device_model_name = dev.get("dmn", "CozyLife Device")
         client._device_type_code = dev.get(CONF_DEVICE_TYPE_CODE, LIGHT_TYPE_CODE)
-        await client._connect()
+        client.name = dev.get("name")
+        # Polling already keeps active connections alive; no second heartbeat loop.
+        client._heartbeat_enabled = False
         clients[dev["did"]] = client
+        is_switch = client.device_type_code == SWITCH_TYPE_CODE
+        interval = entry.options.get(
+            CONF_SWITCH_INTERVAL if is_switch else CONF_LIGHT_INTERVAL,
+            DEFAULT_SWITCH_INTERVAL if is_switch else DEFAULT_LIGHT_INTERVAL,
+        )
+        coordinators[dev["did"]] = CozyLifeCoordinator(hass, entry, client, interval)
+
+    # One offline device must not prevent the rest of the hub from loading.
+    await asyncio.gather(*(coord.async_refresh() for coord in coordinators.values()))
 
     hass.data[DOMAIN][entry.entry_id] = {
         "clients": clients,
+        "coordinators": coordinators,
         "devices": devices,
         LIGHT_ENTITIES_KEY: [],
     }
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        for coordinator in coordinators.values():
+            await coordinator.async_shutdown()
+        for client in clients.values():
+            await client.disconnect()
+        raise
 
     if not hass.services.has_service(DOMAIN, "set_all_effect"):
 
@@ -206,6 +235,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if not isinstance(entry_data, dict):
                     continue
                 for entity in entry_data.get(LIGHT_ENTITIES_KEY, []):
+                    if effect not in entity.effect_list:
+                        continue
                     await entity.async_set_effect(effect)
                     await asyncio.sleep(0.01)
 
@@ -228,6 +259,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if ok:
         entry_data = hass.data[DOMAIN].pop(entry.entry_id, None)
         if entry_data:
+            for coordinator in entry_data.get("coordinators", {}).values():
+                await coordinator.async_shutdown()
             for client in entry_data.get("clients", {}).values():
                 await client.disconnect()
 
