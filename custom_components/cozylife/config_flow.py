@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from ipaddress import IPv4Address
 
 import voluptuous as vol
@@ -15,6 +16,8 @@ from homeassistant.config_entries import (
 from homeassistant.core import callback
 
 from .const import (
+    BRIGHT,
+    CONF_DEFAULT_TRANSITION,
     CONF_DEVICE_TYPE_CODE,
     CONF_DEVICES,
     CONF_LIGHT_INTERVAL,
@@ -22,7 +25,10 @@ from .const import (
     CONF_SWITCH_INTERVAL,
     DEFAULT_LIGHT_INTERVAL,
     DEFAULT_SWITCH_INTERVAL,
+    DEFAULT_TRANSITION_SECONDS,
     DOMAIN,
+    LIGHT_TYPE_CODE,
+    MAX_DEFAULT_TRANSITION_SECONDS,
     SUPPORT_DEVICE_CATEGORY,
     SWITCH_TYPE_CODE,
 )
@@ -74,6 +80,19 @@ def _validate_range(
     if int(start) > int(end):
         return "invalid_range"
     return None
+
+
+def _transition_seconds(value) -> float:
+    """Accept finite durations, including zero for instant commands."""
+    if isinstance(value, bool):
+        raise vol.Invalid("Transition must be a number")
+    try:
+        seconds = float(value)
+    except (ValueError, TypeError, OverflowError) as err:
+        raise vol.Invalid("Transition must be a number") from err
+    if not math.isfinite(seconds) or not 0 <= seconds <= MAX_DEFAULT_TRANSITION_SECONDS:
+        raise vol.Invalid("Transition must be between 0 and 60 seconds")
+    return seconds
 
 
 class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -366,6 +385,12 @@ class CozyLifeOptionsFlow(OptionsFlowWithReload):
     async def async_step_edit_device(self, user_input=None):
         devices = [dict(device) for device in self.config_entry.data[CONF_DEVICES]]
         device = next(device for device in devices if device["did"] == self._device_id)
+        is_switch = device.get(CONF_DEVICE_TYPE_CODE) == SWITCH_TYPE_CODE
+        supports_transition = (
+            device.get(CONF_DEVICE_TYPE_CODE, LIGHT_TYPE_CODE) == LIGHT_TYPE_CODE
+            and BRIGHT in {str(dpid) for dpid in device.get("dpid", [])}
+            and "switch" not in device.get("dmn", "").lower()
+        )
         errors = {}
         if user_input is not None:
             ip = user_input["ip"].strip()
@@ -379,19 +404,41 @@ class CozyLifeOptionsFlow(OptionsFlowWithReload):
                 errors["base"] = "duplicate_ip"
             else:
                 try:
-                    if device.get(CONF_DEVICE_TYPE_CODE) == SWITCH_TYPE_CODE:
+                    if is_switch:
                         device["rockers"] = vol.All(
                             vol.Coerce(int), vol.Range(min=1, max=8)
                         )(user_input.get("rockers", device.get("rockers", 1)))
+                    elif supports_transition:
+                        device[CONF_DEFAULT_TRANSITION] = _transition_seconds(
+                            user_input.get(
+                                CONF_DEFAULT_TRANSITION,
+                                device.get(
+                                    CONF_DEFAULT_TRANSITION, DEFAULT_TRANSITION_SECONDS
+                                ),
+                            )
+                        )
                 except vol.Invalid:
-                    errors["base"] = "invalid_rockers"
+                    errors["base"] = (
+                        "invalid_rockers" if is_switch else "invalid_transition"
+                    )
                 else:
                     device["ip"] = ip
                     return self._save_devices(devices)
         schema = {vol.Required("ip", default=device["ip"]): str}
-        if device.get(CONF_DEVICE_TYPE_CODE) == SWITCH_TYPE_CODE:
+        if is_switch:
             schema[vol.Required("rockers", default=device.get("rockers", 1))] = vol.All(
                 vol.Coerce(int), vol.Range(min=1, max=8)
+            )
+        elif supports_transition:
+            schema[
+                vol.Required(
+                    CONF_DEFAULT_TRANSITION,
+                    default=device.get(
+                        CONF_DEFAULT_TRANSITION, DEFAULT_TRANSITION_SECONDS
+                    ),
+                )
+            ] = vol.All(
+                vol.Coerce(float), vol.Range(min=0, max=MAX_DEFAULT_TRANSITION_SECONDS)
             )
         return self.async_show_form(
             step_id="edit_device", data_schema=vol.Schema(schema), errors=errors

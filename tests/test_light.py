@@ -5,10 +5,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.components.light import ColorMode
+from homeassistant.core import State
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.cozylife.coordinator import CozyLifeCoordinator
-from custom_components.cozylife.light import SCENES, CozyLifeLight
+from custom_components.cozylife.light import (
+    SCENES,
+    CozyLifeLight,
+    CozyLifeSwitchAsLight,
+)
 from custom_components.cozylife.tcp_client import tcp_client
 
 
@@ -22,17 +27,138 @@ async def light(hass, entry):
     client.control = AsyncMock(return_value=True)
     coordinator = CozyLifeCoordinator(hass, entry, client, 60)
     await coordinator.async_refresh()
-    entity = CozyLifeLight(coordinator, hass, SCENES)
+    entity = CozyLifeLight(coordinator, hass, SCENES, default_transition=0)
     entity._apply_state(coordinator.data)
     yield entity
     await coordinator.async_shutdown()
 
 
 async def test_no_distance_transition_still_turns_on(light):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 1000})
+    light._apply_state(light.coordinator.data)
     await light.async_turn_on(transition=0.01)
     light._tcp_client.control.assert_awaited_once_with({"1": 255, "2": 1})
     assert light.is_on
     assert light.unique_id == "131976607c2c67d1c8dc"
+
+
+async def test_plain_turn_on_with_transition_fades_to_previous_brightness(light):
+    light.coordinator.async_set_updated_data({"1": 0, "2": 1, "4": 400})
+    light._apply_state(light.coordinator.data)
+    await light.async_turn_on(transition=0.01)
+    payloads = [call.args[0] for call in light._tcp_client.control.call_args_list]
+    assert len(payloads) >= 2
+    assert payloads[0]["4"] == 0
+    assert payloads[-1]["4"] == 400
+    assert all("13" not in payload for payload in payloads)
+    assert light.is_on
+    assert light.brightness == 102
+
+
+@pytest.mark.parametrize("transition", [0, 0.01])
+async def test_turn_on_after_fade_off_restores_brightness(light, transition):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 400})
+    light._apply_state(light.coordinator.data)
+    await light.async_turn_off(transition=0.01)
+    assert not light.is_on
+    assert light.coordinator.data["4"] == 0
+    assert light.extra_state_attributes["last_brightness"] == 400
+    light._tcp_client.control.reset_mock()
+    await light.async_turn_on(transition=transition)
+    assert light._tcp_client.control.call_args.args[0]["4"] == 400
+    assert light.is_on
+    assert light.brightness == 102
+
+
+async def test_brightness_poll_is_used_for_next_fade(light):
+    light.coordinator.async_set_updated_data({"1": 0, "2": 1, "4": 10})
+    light._apply_state(light.coordinator.data)
+    await light.async_turn_on(transition=0.01)
+    assert light._tcp_client.control.call_args.args[0]["4"] == 10
+    assert light.extra_state_attributes["last_brightness"] == 10
+
+
+async def test_new_brightness_overrides_remembered_level(light):
+    await light.async_turn_on(brightness=50, transition=0.01)
+    assert light.extra_state_attributes["last_brightness"] == 196
+    await light.async_turn_off(transition=0.01)
+    await light.async_turn_on(transition=0.01)
+    assert light.brightness == 50
+
+
+async def test_dimmable_light_defaults_to_two_seconds(light, mocker):
+    entity = CozyLifeLight(light.coordinator, light.hass, SCENES)
+    entity._apply_state(light.coordinator.data)
+    run = mocker.patch.object(entity, "_async_run_command")
+    await entity.async_turn_on()
+    assert run.call_args.args == ({"1": 255, "2": 1, "4": 1000}, 2, "manual")
+    entity.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 1000})
+    await entity.async_turn_off()
+    assert run.call_args.args == ({"1": 255, "2": 1, "4": 0}, 2)
+    assert run.call_args.kwargs == {"turn_off": True}
+
+
+async def test_default_fade_and_explicit_zero_override(light):
+    light._default_transition = 0.01
+    await light.async_turn_on()
+    assert light._tcp_client.control.await_count >= 2
+    light._tcp_client.control.reset_mock()
+    await light.async_turn_off()
+    assert light._tcp_client.control.await_count >= 3
+    light._tcp_client.control.reset_mock()
+    await light.async_turn_on(transition=0)
+    light._tcp_client.control.assert_awaited_once()
+    light._tcp_client.control.reset_mock()
+    await light.async_turn_off(transition=0)
+    light._tcp_client.control.assert_awaited_once_with({"1": 0})
+
+
+async def test_explicit_duration_overrides_default(light, mocker):
+    light._default_transition = 2
+    run = mocker.patch.object(light, "_async_run_command")
+    await light.async_turn_on(transition=0.5)
+    assert run.call_args.args[1] == 0.5
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 1000})
+    await light.async_turn_off(transition=0.5)
+    assert run.call_args.args[1] == 0.5
+
+
+@pytest.mark.parametrize("live_brightness,expected", [(0, 400), (10, 10)])
+async def test_remembered_brightness_restores_without_device_writes(
+    light, mocker, live_brightness, expected
+):
+    light.coordinator.async_set_updated_data({"1": 0, "2": 1, "4": live_brightness})
+    light._apply_state(light.coordinator.data)
+    mocker.patch.object(CozyLifeSwitchAsLight, "async_added_to_hass")
+    mocker.patch.object(
+        light,
+        "async_get_last_state",
+        return_value=State("light.strip", "off", {"last_brightness": 400}),
+    )
+    mocker.patch(
+        "custom_components.cozylife.light.async_track_time_interval",
+        return_value=lambda: None,
+    )
+    await light.async_added_to_hass()
+    assert light.extra_state_attributes["last_brightness"] == expected
+    light._tcp_client.control.assert_not_awaited()
+
+
+async def test_onoff_only_light_has_no_default_fade(light, mocker):
+    light._tcp_client._dpid = [1]
+    entity = CozyLifeLight(light.coordinator, light.hass, SCENES)
+    run = mocker.patch.object(entity, "_async_run_command")
+    await entity.async_turn_on()
+    assert run.call_args.args == ({"1": 255}, 0, "manual")
+    await entity.async_turn_off()
+    assert run.call_args.args == ({"1": 0}, 0)
+
+
+async def test_turn_off_already_off_never_powers_on_for_fade(light):
+    light._default_transition = 2
+    await light.async_turn_off()
+    light._tcp_client.control.assert_awaited_once_with({"1": 0})
+    assert not light.is_on
 
 
 @pytest.mark.parametrize("effect", ["sleep", "warm", "study"])

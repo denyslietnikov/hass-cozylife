@@ -67,6 +67,24 @@ setup never writes these settings. RGB-only white effects use HS values rather
 than unsupported CCT commands. Additional packed/static-color formats remain
 unsupported pending hardware validation.
 
+### Light Transitions
+
+Dimmable lights fade in and out over 2 seconds by default, including ordinary
+HA toggles and automation actions without an explicit transition. Change this
+per device in CozyLife > Configure > Edit a device > Default transition (seconds).
+The range is 0 to 60 seconds; 0 disables the default fade. Relay switches and
+on/off-only lights are unaffected.
+
+An explicit `transition` in a light action overrides the device default,
+including `transition: 0` for instant switching. A fade-out remembers the previous
+brightness for the next turn-on, including across reloads via HA's restored
+state. Startup does not write brightness or turn on the light. The native
+`chrismas` effect remains immediate; its animation runs in the device.
+
+These are software brightness transitions, not a Countdown setting. Network
+latency and the controller's brightness resolution can affect smoothness,
+particularly at very low brightness. Physical power cuts cannot be faded.
+
 ### Native Light Countdown
 
 Lights advertising DPID 13 get a disabled-by-default **Countdown** number entity.

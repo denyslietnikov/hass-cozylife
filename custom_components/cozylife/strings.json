@@ -55,7 +55,8 @@
         "title": "Device settings",
         "data": {
           "ip": "IP address",
-          "rockers": "Number of relays"
+          "rockers": "Number of relays",
+          "default_transition": "Default transition (seconds)"
         }
       }
     },
@@ -66,7 +67,8 @@
       "invalid_range": "End IP must be greater than or equal to start IP.",
       "duplicate_ip": "This IP address is already used by another device.",
       "invalid_interval": "Polling intervals must be between 1 and 300 seconds.",
-      "invalid_rockers": "The number of relays must be between 1 and 8."
+      "invalid_rockers": "The number of relays must be between 1 and 8.",
+      "invalid_transition": "Transition must be between 0 and 60 seconds. Use 0 for instant switching."
     }
   },
   "entity": {

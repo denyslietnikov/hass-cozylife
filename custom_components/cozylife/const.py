@@ -10,8 +10,11 @@ CONF_SUBNET = "subnet"
 CONF_DEVICES = "devices"
 CONF_SWITCH_INTERVAL = "switch_interval"
 CONF_LIGHT_INTERVAL = "light_interval"
+CONF_DEFAULT_TRANSITION = "default_transition"
 DEFAULT_SWITCH_INTERVAL = 5
 DEFAULT_LIGHT_INTERVAL = 60
+DEFAULT_TRANSITION_SECONDS = 2
+MAX_DEFAULT_TRANSITION_SECONDS = 60
 SCENES = ["manual", "natural", "sleep", "warm", "study", "chrismas"]
 
 PLATFORMS = ["light", "switch", "select", "number"]

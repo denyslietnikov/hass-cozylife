@@ -32,9 +32,11 @@ from homeassistant.util import color as colorutil
 
 from .const import (
     BRIGHT,
+    CONF_DEFAULT_TRANSITION,
     CONF_DEVICE_TYPE_CODE,
     DEFAULT_MAX_KELVIN,
     DEFAULT_MIN_KELVIN,
+    DEFAULT_TRANSITION_SECONDS,
     DOMAIN,
     HUE,
     LIGHT_TYPE_CODE,
@@ -108,7 +110,16 @@ async def async_setup_entry(
         if "switch" in dev.get("dmn", "").lower():
             entities.append(CozyLifeSwitchAsLight(coordinator, hass))
         else:
-            entities.append(CozyLifeLight(coordinator, hass, SCENES))
+            entities.append(
+                CozyLifeLight(
+                    coordinator,
+                    hass,
+                    SCENES,
+                    default_transition=dev.get(
+                        CONF_DEFAULT_TRANSITION, DEFAULT_TRANSITION_SECONDS
+                    ),
+                )
+            )
 
     if entities:
         async_add_entities(entities)
@@ -238,7 +249,11 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
     _unrecorded_attributes = frozenset({"brightness", "color_temp_kelvin"})
 
     def __init__(
-        self, coordinator: CozyLifeCoordinator, hass, scenes: list[str]
+        self,
+        coordinator: CozyLifeCoordinator,
+        hass,
+        scenes: list[str],
+        default_transition: float = DEFAULT_TRANSITION_SECONDS,
     ) -> None:
         """Initialize."""
         super().__init__(coordinator, hass)
@@ -249,6 +264,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._transition_task = None
         self._command_lock = asyncio.Lock()
         self._effect = "manual"
+        self._last_brightness = 1000
         self._cl = None
         self._max_brightness = 255
         self._min_brightness = 1
@@ -262,6 +278,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._attr_color_temp_kelvin = DEFAULT_MAX_KELVIN
 
         dpid = _dpid_set(tcp_client)
+        self._default_transition = default_transition if BRIGHT in dpid else 0
         supported: set[ColorMode] = set()
         if TEMP in dpid:
             supported.add(ColorMode.COLOR_TEMP)
@@ -304,6 +321,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         """Return extra state attributes."""
         return {
             "last_effect": self._effect,
+            "last_brightness": self._last_brightness,
             "transitioning": self._transitioning,
         }
 
@@ -351,6 +369,10 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         last_state = await self.async_get_last_state()
         if last_state and last_state.attributes.get("last_effect") in self.effect_list:
             self._effect = last_state.attributes["last_effect"]
+        if last_state and not (self.coordinator.data or {}).get("4"):
+            brightness = last_state.attributes.get("last_brightness")
+            if type(brightness) is int and 1 <= brightness <= 1000:
+                self._last_brightness = brightness
         self.async_on_remove(
             async_track_time_interval(
                 self.hass, self._async_natural_update, SCAN_INTERVAL
@@ -398,6 +420,12 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
             return
         if isinstance(state.get("4"), (int, float)):
             self._attr_brightness = max(0, min(255, round(state["4"] / 1000 * 255)))
+            if (
+                not self._transition_task
+                and type(state["4"]) is int
+                and 1 <= state["4"] <= 1000
+            ):
+                self._last_brightness = state["4"]
         if (
             state.get("2", 0) == 0
             and ColorMode.COLOR_TEMP in self.supported_color_modes
@@ -451,7 +479,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 raise HomeAssistantError("HS color is not supported by this device")
             payload.update({"2": 1, "5": round(hs[0]), "6": round(hs[1] * 10)})
             changed = True
-        transition = kwargs.get(ATTR_TRANSITION, 0)
+        transition = kwargs.get(ATTR_TRANSITION, self._default_transition)
         if changed:
             effect = "manual"
         elif effect in ("sleep", "warm", "study"):
@@ -469,7 +497,6 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 payload["4"] = round(brightness / 255 * 1000)
             if kelvin is not None:
                 payload.update(self._white_payload(kelvin))
-            transition = kwargs.get(ATTR_TRANSITION, 5 if CIRCADIAN_BRIGHTNESS else 0)
         elif effect == "chrismas":
             payload.update(
                 {
@@ -480,6 +507,13 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 }
             )
             transition = 0
+        state = self.coordinator.data or {}
+        if (
+            BRIGHT in dpids
+            and "4" not in payload
+            and ((transition and not state.get("1")) or state.get("4") == 0)
+        ):
+            payload["4"] = self._last_brightness
         await self._async_run_command(payload, transition, effect)
 
     async def _async_run_command(
@@ -534,6 +568,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 await self.coordinator.async_control(payload)
                 if turn_off:
                     await self.coordinator.async_control({"1": 0})
+                elif type(payload.get("4")) is int and 1 <= payload["4"] <= 1000:
+                    self._last_brightness = payload["4"]
                 if effect is not None:
                     self._effect = effect
                 self._apply_state(self.coordinator.data)
@@ -546,8 +582,12 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Fade brightness in the current color mode before switching off."""
-        transition = kwargs.get(ATTR_TRANSITION, 5 if self._effect == "natural" else 0)
-        if transition and BRIGHT in _dpid_set(self._tcp_client):
+        transition = kwargs.get(ATTR_TRANSITION, self._default_transition)
+        if (
+            transition
+            and BRIGHT in _dpid_set(self._tcp_client)
+            and (self.coordinator.data or {}).get("1")
+        ):
             payload = {"1": 255, "4": 0}
             if "2" in _dpid_set(self._tcp_client):
                 payload["2"] = 1 if self.color_mode == ColorMode.HS else 0

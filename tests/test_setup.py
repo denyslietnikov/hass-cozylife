@@ -174,6 +174,93 @@ async def test_rgb_light_loads_effects_and_cleans_up(hass, entry, mock_device, m
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_default_light_fade_toggle_and_options_reload(
+    hass, entry, mock_device, mocker
+):
+    device, host, port = mock_device
+    device.state["4"] = 400
+    metadata = {
+        "ip": host,
+        "did": device.device_info["did"],
+        "pid": "o0mmpn",
+        "dmn": "Smart led Strip",
+        "device_type_code": "01",
+        "dpid": [1, 2, 4, 5, 6],
+    }
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, "subnet": "127.0.0", "devices": [metadata]},
+    )
+    client = tcp_client(host)
+    client._port = port
+    mocker.patch("custom_components.cozylife.tcp_client", return_value=client)
+    register_integration(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("light", DOMAIN, client.device_id)
+    assert entity_id
+    assert entry.runtime_data.light_entities[0]._default_transition == 2
+
+    started = asyncio.get_running_loop().time()
+    await hass.services.async_call(
+        "light", "toggle", {"entity_id": entity_id}, blocking=True
+    )
+    assert 2 <= asyncio.get_running_loop().time() - started < 3
+    writes = [
+        request["msg"]["data"] for request in device.requests if request["cmd"] == 3
+    ]
+    assert len(writes) > 2
+    assert writes[0]["4"] == 0
+    assert writes[-1]["4"] == 400
+    assert hass.states.get(entity_id).state == "on"
+    assert hass.states.get(entity_id).attributes["brightness"] == 102
+    device.requests.clear()
+    await hass.services.async_call(
+        "light", "toggle", {"entity_id": entity_id}, blocking=True
+    )
+    writes = [
+        request["msg"]["data"] for request in device.requests if request["cmd"] == 3
+    ]
+    assert writes[-2]["4"] == 0
+    assert writes[-1] == {"1": 0}
+    assert hass.states.get(entity_id).state == "off"
+    assert hass.states.get(entity_id).attributes["last_brightness"] == 400
+
+    menu = await hass.config_entries.options.async_init(entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "device"}
+    )
+    await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"did": client.device_id}
+    )
+    await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"ip": host, "default_transition": 0.02}
+    )
+    await hass.async_block_till_done()
+    assert registry.async_get_entity_id("light", DOMAIN, client.device_id) == entity_id
+    entity = entry.runtime_data.light_entities[0]
+    assert entity._default_transition == 0.02
+    assert entity.extra_state_attributes["last_brightness"] == 400
+    assert not any("13" in write for write in writes)
+
+    device.requests.clear()
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": entity_id}, blocking=True
+    )
+    assert device.state["4"] == 400
+    assert len([request for request in device.requests if request["cmd"] == 3]) >= 2
+    device.requests.clear()
+    await hass.services.async_call(
+        "light", "turn_off", {"entity_id": entity_id, "transition": 0}, blocking=True
+    )
+    writes = [
+        request["msg"]["data"] for request in device.requests if request["cmd"] == 3
+    ]
+    assert writes == [{"1": 0}]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_native_countdown_service_and_reload(
     hass, entry, mock_device, mocker, enabled
