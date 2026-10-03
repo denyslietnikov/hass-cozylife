@@ -1,18 +1,23 @@
 """Read-only, redacted diagnostics; never trigger device commands."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from homeassistant.components.diagnostics import async_redact_data
 
-from .const import DOMAIN
+if TYPE_CHECKING:
+    from .runtime import CozyLifeConfigEntry
 
 TO_REDACT = {"ip", "did", "start_ip", "end_ip", "subnet", "unique_id", "name"}
 
 
-async def async_get_config_entry_diagnostics(hass, entry):
-    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+async def async_get_config_entry_diagnostics(hass, entry: CozyLifeConfigEntry):
+    runtime = getattr(entry, "runtime_data", None)
     devices = []
     for device in entry.data.get("devices", []):
-        coordinator = runtime.get("coordinators", {}).get(device["did"])
-        client = runtime.get("clients", {}).get(device["did"])
+        coordinator = runtime.coordinators.get(device["did"]) if runtime else None
+        client = runtime.clients.get(device["did"]) if runtime else None
         devices.append(
             {
                 "metadata": dict(device),

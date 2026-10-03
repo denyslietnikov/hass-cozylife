@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
@@ -20,11 +20,8 @@ from homeassistant.components.light import (
     LightEntity,
     LightEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_EFFECT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
@@ -42,10 +39,14 @@ from .const import (
     HUE,
     LIGHT_TYPE_CODE,
     SAT,
+    SCENES,
     TEMP,
 )
 from .coordinator import CozyLifeCoordinator
 from .tcp_client import tcp_client
+
+if TYPE_CHECKING:
+    from .runtime import CozyLifeConfigEntry
 
 LIGHT_SCHEMA = vol.Schema(
     {
@@ -79,12 +80,6 @@ except Exception:
 
 _LOGGER = logging.getLogger(__name__)
 
-SERVICE_SET_EFFECT = "set_effect"
-SCENES = ["manual", "natural", "sleep", "warm", "study", "chrismas"]
-SERVICE_SCHEMA_SET_EFFECT = {
-    vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in SCENES])
-}
-
 
 def _dpid_set(client: tcp_client) -> set[str]:
     """Return DPID values as strings."""
@@ -93,13 +88,13 @@ def _dpid_set(client: tcp_client) -> set[str]:
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: CozyLifeConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CozyLife lights from a hub config entry."""
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    coordinators = entry_data["coordinators"]
-    devices = entry_data["devices"]
+    runtime = entry.runtime_data
+    coordinators = runtime.coordinators
+    devices = runtime.devices
 
     entities: list[LightEntity] = []
     for dev in devices:
@@ -118,14 +113,8 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
-    entry_data.setdefault("light_entities", [])
-    entry_data["light_entities"].extend(
+    runtime.light_entities.extend(
         entity for entity in entities if isinstance(entity, CozyLifeLight)
-    )
-
-    platform = entity_platform.async_get_current_platform()
-    platform.async_register_entity_service(
-        SERVICE_SET_EFFECT, SERVICE_SCHEMA_SET_EFFECT, "async_set_effect"
     )
 
 
@@ -140,6 +129,12 @@ async def async_setup_platform(
         "Configuration of CozyLife lights via YAML is deprecated. "
         "The YAML config will be imported as config entries."
     )
+    if config.get("optimistic"):
+        _LOGGER.warning(
+            "CozyLife ignores the legacy optimistic option. "
+            "Polling remains enabled to track physical device changes; "
+            "commands update state after acknowledgement."
+        )
     for item in config.get("lights", []):
         import_data = {
             "ip": item["ip"],

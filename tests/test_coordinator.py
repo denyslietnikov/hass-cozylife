@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.cozylife.coordinator import CozyLifeCoordinator
 from custom_components.cozylife.switch import CozyLifeSwitch
@@ -58,6 +59,31 @@ async def test_failed_write_not_published(coordinator):
         await CozyLifeSwitch(coordinator, "wippe1").async_turn_on()
     assert coordinator.data == {"1": 2}
     assert not coordinator.last_update_success
+
+
+@pytest.mark.parametrize(
+    "state,error,message",
+    [
+        (None, "TimeoutError", "Unable to query device: TimeoutError"),
+        (
+            None,
+            "ConnectionRefusedError",
+            "Unable to query device: ConnectionRefusedError",
+        ),
+        (None, None, "Unable to query device: no response"),
+        ({}, None, "Invalid power state: DPID 1 must be an integer 0..255"),
+        ({"1": "0"}, None, "Invalid power state: DPID 1 must be an integer 0..255"),
+    ],
+)
+async def test_query_distinguishes_transport_and_invalid_state(
+    coordinator, state, error, message
+):
+    coordinator.client.query.return_value = state
+    coordinator.client.last_error = error
+    with pytest.raises(UpdateFailed, match=message):
+        await coordinator._query()
+    assert coordinator.data == {"1": 2}
+    coordinator.client.control.assert_not_awaited()
 
 
 async def test_concurrent_rockers_preserve_bits(coordinator):

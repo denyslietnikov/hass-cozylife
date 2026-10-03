@@ -7,9 +7,12 @@ import logging
 from ipaddress import IPv4Address
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, OptionsFlowWithReload
+from homeassistant.config_entries import (
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     CONF_DEVICE_TYPE_CODE,
@@ -134,7 +137,7 @@ class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
             seen_dids.add(result["did"])
         return devices
 
-    async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
+    async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Handle the user step."""
         errors: dict[str, str] = {}
 
@@ -198,7 +201,7 @@ class CozyLifeConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def async_step_import(self, import_data: dict) -> FlowResult:
+    async def async_step_import(self, import_data: dict) -> ConfigFlowResult:
         """Import YAML platform configuration into a subnet hub."""
         subnet = _get_subnet(import_data["ip"])
 

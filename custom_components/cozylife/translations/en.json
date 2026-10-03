@@ -70,6 +70,11 @@
     }
   },
   "entity": {
+    "number": {
+      "countdown": {
+        "name": "Countdown"
+      }
+    },
     "select": {
       "power_on_state": {
         "name": "Power-on state",

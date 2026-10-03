@@ -12,8 +12,9 @@ CONF_SWITCH_INTERVAL = "switch_interval"
 CONF_LIGHT_INTERVAL = "light_interval"
 DEFAULT_SWITCH_INTERVAL = 5
 DEFAULT_LIGHT_INTERVAL = 60
+SCENES = ["manual", "natural", "sleep", "warm", "study", "chrismas"]
 
-PLATFORMS = ["light", "switch", "select"]
+PLATFORMS = ["light", "switch", "select", "number"]
 
 PLATFORMS_BY_TYPE = {
     LIGHT_TYPE_CODE: "light",
@@ -27,6 +28,7 @@ TEMP = "3"
 BRIGHT = "4"
 HUE = "5"
 SAT = "6"
+LIGHT_COUNTDOWN = "13"
 
 LIGHT_DPID = [SWITCH, WORK_MODE, TEMP, BRIGHT, HUE, SAT]
 SWITCH_DPID = [

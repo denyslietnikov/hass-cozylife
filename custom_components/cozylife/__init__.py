@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 try:
     import homeassistant.helpers.config_validation as cv
     import voluptuous as vol
+    from homeassistant.components.light import LightEntityFeature
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.const import CONF_EFFECT
     from homeassistant.core import HomeAssistant, ServiceCall
+    from homeassistant.helpers import service
     from homeassistant.helpers.typing import ConfigType
 except ModuleNotFoundError as err:
     if err.name != "homeassistant":
@@ -35,17 +37,20 @@ from .const import (
     DOMAIN,
     LIGHT_TYPE_CODE,
     PLATFORMS,
+    SCENES,
     SWITCH_TYPE_CODE,
 )
+from .runtime import CozyLifeRuntimeData
 from .tcp_client import tcp_client
+
+if TYPE_CHECKING:
+    from .runtime import CozyLifeConfigEntry
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN) if cv else None
 
 _LOGGER = logging.getLogger(__name__)
 
-LIGHT_ENTITIES_KEY = "light_entities"
 _ABSORBED_IDS_KEY = "_absorbed_ids"
-_SCENES = ["manual", "natural", "sleep", "warm", "study", "chrismas"]
 
 
 def _get_subnet(ip: str) -> str:
@@ -130,6 +135,35 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the CozyLife integration."""
     hass.data.setdefault(DOMAIN, {})
 
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        "set_effect",
+        entity_domain="light",
+        schema={vol.Required(CONF_EFFECT): vol.In(SCENES)},
+        func="async_set_effect",
+        required_features=[LightEntityFeature.EFFECT],
+    )
+
+    async def async_set_all_effect(call: ServiceCall) -> None:
+        effect = call.data[CONF_EFFECT]
+        for loaded_entry in hass.config_entries.async_loaded_entries(DOMAIN):
+            runtime = getattr(loaded_entry, "runtime_data", None)
+            if runtime is None:
+                continue
+            for entity in runtime.light_entities:
+                if effect not in entity.effect_list:
+                    continue
+                await entity.async_set_effect(effect)
+                await asyncio.sleep(0.01)
+
+    hass.services.async_register(
+        DOMAIN,
+        "set_all_effect",
+        async_set_all_effect,
+        schema=vol.Schema({vol.Required(CONF_EFFECT): vol.In(SCENES)}),
+    )
+
     entries = hass.config_entries.async_entries(DOMAIN)
     by_subnet: dict[str, list[ConfigEntry]] = {}
     for entry in entries:
@@ -172,7 +206,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: CozyLifeConfigEntry) -> bool:
     """Set up a CozyLife hub config entry."""
     hass.data.setdefault(DOMAIN, {})
 
@@ -206,62 +240,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         coordinators[dev["did"]] = CozyLifeCoordinator(hass, entry, client, interval)
 
-    # One offline device must not prevent the rest of the hub from loading.
-    await asyncio.gather(*(coord.async_refresh() for coord in coordinators.values()))
-
-    hass.data[DOMAIN][entry.entry_id] = {
-        "clients": clients,
-        "coordinators": coordinators,
-        "devices": devices,
-        LIGHT_ENTITIES_KEY: [],
-    }
-
+    entry.runtime_data = runtime = CozyLifeRuntimeData(clients, coordinators, devices)
     try:
+        # One offline device must not prevent the rest of the hub from loading.
+        await asyncio.gather(
+            *(coord.async_refresh() for coord in coordinators.values())
+        )
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-        for coordinator in coordinators.values():
-            await coordinator.async_shutdown()
-        for client in clients.values():
-            await client.disconnect()
+        await runtime.async_shutdown()
+        del entry.runtime_data
         raise
-
-    if not hass.services.has_service(DOMAIN, "set_all_effect"):
-
-        async def async_set_all_effect(call: ServiceCall) -> None:
-            effect = call.data.get(CONF_EFFECT)
-            entries_data = hass.data.get(DOMAIN, {})
-            for entry_data in entries_data.values():
-                if not isinstance(entry_data, dict):
-                    continue
-                for entity in entry_data.get(LIGHT_ENTITIES_KEY, []):
-                    if effect not in entity.effect_list:
-                        continue
-                    await entity.async_set_effect(effect)
-                    await asyncio.sleep(0.01)
-
-        hass.services.async_register(
-            DOMAIN,
-            "set_all_effect",
-            async_set_all_effect,
-            schema=vol.Schema({vol.Required(CONF_EFFECT): vol.In(_SCENES)}),
-        )
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: CozyLifeConfigEntry) -> bool:
     """Unload a CozyLife hub config entry."""
-    if entry.entry_id not in hass.data.get(DOMAIN, {}):
+    if not hasattr(entry, "runtime_data"):
         return True
 
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if ok:
-        entry_data = hass.data[DOMAIN].pop(entry.entry_id, None)
-        if entry_data:
-            for coordinator in entry_data.get("coordinators", {}).values():
-                await coordinator.async_shutdown()
-            for client in entry_data.get("clients", {}).values():
-                await client.disconnect()
+        await entry.runtime_data.async_shutdown()
+        del entry.runtime_data
 
     return ok

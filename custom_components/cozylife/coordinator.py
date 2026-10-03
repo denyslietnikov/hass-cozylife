@@ -10,6 +10,8 @@ from datetime import timedelta
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .const import LIGHT_COUNTDOWN, LIGHT_TYPE_CODE
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -32,17 +34,27 @@ class CozyLifeCoordinator(DataUpdateCoordinator[dict]):
 
     async def _query(self) -> dict:
         state = await self.client.query()
+        if state is None:
+            reason = self.client.last_error or "no response"
+            raise UpdateFailed(f"Unable to query device: {reason}")
         if (
             not isinstance(state, dict)
             or type(state.get("1")) is not int
             or not 0 <= state["1"] <= 255
         ):
-            raise UpdateFailed("Device returned no valid relay state")
-        optional = [
-            int(dpid)
-            for dpid in self.async_contexts()
-            if dpid in ("18", "19") and dpid not in state
-        ]
+            raise UpdateFailed("Invalid power state: DPID 1 must be an integer 0..255")
+        optional_dpids = {"18", "19"}
+        if self.client.device_type_code == LIGHT_TYPE_CODE and LIGHT_COUNTDOWN in {
+            str(dpid) for dpid in self.client.dpid or []
+        }:
+            optional_dpids.add(LIGHT_COUNTDOWN)
+        optional = sorted(
+            {
+                int(dpid)
+                for dpid in self.async_contexts()
+                if dpid in optional_dpids and dpid not in state
+            }
+        )
         if optional:
             settings = await self.client.query(optional)
             if isinstance(settings, dict):
@@ -51,7 +63,7 @@ class CozyLifeCoordinator(DataUpdateCoordinator[dict]):
                     **{
                         key: value
                         for key, value in settings.items()
-                        if key in ("18", "19")
+                        if key in {str(dpid) for dpid in optional}
                     },
                 }
         return state

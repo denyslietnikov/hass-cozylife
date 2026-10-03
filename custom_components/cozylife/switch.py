@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant.components.switch import PLATFORM_SCHEMA, SwitchEntity
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -17,6 +16,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEVICE_TYPE_CODE, DOMAIN, SWITCH_TYPE_CODE
 from .coordinator import CozyLifeCoordinator
+
+if TYPE_CHECKING:
+    from .runtime import CozyLifeConfigEntry
 
 SWITCH_SCHEMA = vol.Schema(
     {
@@ -42,13 +44,12 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: CozyLifeConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CozyLife switches from a hub config entry."""
-    entry_data = hass.data[DOMAIN][entry.entry_id]
-    coordinators = entry_data["coordinators"]
-    devices = entry_data["devices"]
+    coordinators = entry.runtime_data.coordinators
+    devices = entry.runtime_data.devices
 
     entities: list[CozyLifeSwitch] = []
     for dev in devices:
@@ -78,6 +79,12 @@ async def async_setup_platform(
         "Configuration of CozyLife switches via YAML is deprecated. "
         "The YAML config will be imported as config entries."
     )
+    if config.get("optimistic"):
+        _LOGGER.warning(
+            "CozyLife ignores the legacy optimistic option. "
+            "Polling remains enabled to track physical device changes; "
+            "commands update state after acknowledgement."
+        )
 
     for item in config.get("switches", []):
         await _import_switch(hass, item, rockers=1)

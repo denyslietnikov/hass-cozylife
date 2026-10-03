@@ -130,12 +130,14 @@ class tcp_client(object):
         if self.available:
             if self._expected_device_id:
                 info = await self._send_and_read(CMD_INFO, {})
-                if (
-                    not info
-                    or info.get("res") != 0
-                    or not isinstance(info.get("msg"), dict)
-                    or info["msg"].get("did") != self._expected_device_id
-                ):
+                if info is None:
+                    await self._close_writer()
+                    return False
+                if info.get("res") != 0 or not isinstance(info.get("msg"), dict):
+                    self.last_error = "Invalid device identity response"
+                    await self._close_writer()
+                    return False
+                if info["msg"].get("did") != self._expected_device_id:
                     self.last_error = "Device identity mismatch"
                     await self._close_writer()
                     return False
@@ -352,16 +354,29 @@ class tcp_client(object):
         """Send a command and return response data."""
         async with self._io_lock:
             response = await self._send_and_read(cmd, payload)
+            # An idle stream can close between available and readline. Only
+            # replay reads after a broken stream, never writes or timeouts.
+            if (
+                cmd == CMD_QUERY
+                and response is None
+                and self.last_error
+                in ("ConnectionError", "ConnectionResetError", "BrokenPipeError")
+            ):
+                _LOGGER.debug("Retrying query after a closed stream for %s", self._ip)
+                response = await self._send_and_read(cmd, payload)
 
-        if (
-            response is None
-            or response.get("res") != 0
-            or not isinstance(response.get("msg"), dict)
-        ):
+        if response is None:
+            return None
+        if response.get("res") != 0:
+            self.last_error = "Device rejected query"
+            return None
+        if not isinstance(response.get("msg"), dict):
+            self.last_error = "Invalid query response: missing msg"
             return None
 
         data = response["msg"].get("data")
         if not isinstance(data, dict):
+            self.last_error = "Invalid query response: missing data"
             return None
         attributes = response["msg"].get("attr", [])
         if cmd == CMD_QUERY and isinstance(attributes, list):
@@ -389,7 +404,10 @@ class tcp_client(object):
 
         if response is None:
             return False
-        return response.get("res", -1) == 0
+        if response.get("res", -1) != 0:
+            self.last_error = "Device rejected command"
+            return False
+        return True
 
     async def control(self, payload: dict) -> bool:
         """Control device DPID values."""

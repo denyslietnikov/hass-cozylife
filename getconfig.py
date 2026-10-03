@@ -8,11 +8,15 @@ from custom_components.cozylife.tcp_client import tcp_client
 
 async def scan_device(ip):
     a = tcp_client(ip, timeout=0.1)
-    await a._connect()
-    if a._writer:
-        await a._device_info()
-        return a
-    return None
+    try:
+        await a._connect(start_heartbeat=False)
+        if a.available:
+            await a._device_info()
+            if a.device_id:
+                return a
+        return None
+    finally:
+        await a.disconnect()
 
 
 async def main():

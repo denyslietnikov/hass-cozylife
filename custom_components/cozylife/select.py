@@ -1,5 +1,9 @@
 """Optional device configuration, exposed only for advertised DPIDs."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.const import EntityCategory
 from homeassistant.exceptions import HomeAssistantError
@@ -8,6 +12,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEVICE_TYPE_CODE, DOMAIN, SWITCH_TYPE_CODE
 from .coordinator import CozyLifeCoordinator
+
+if TYPE_CHECKING:
+    from .runtime import CozyLifeConfigEntry
 
 SETTINGS = {
     "18": (
@@ -19,15 +26,15 @@ SETTINGS = {
 }
 
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    data = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_entry(hass, entry: CozyLifeConfigEntry, async_add_entities):
+    data = entry.runtime_data
     entities = []
-    for device in data["devices"]:
+    for device in data.devices:
         if device.get(CONF_DEVICE_TYPE_CODE) != SWITCH_TYPE_CODE:
             continue
         dpids = {str(dpid) for dpid in device.get("dpid", [])}
         for dpid in sorted(SETTINGS.keys() & dpids):
-            entities.append(CozyLifeSetting(data["coordinators"][device["did"]], dpid))
+            entities.append(CozyLifeSetting(data.coordinators[device["did"]], dpid))
     async_add_entities(entities)
 
 

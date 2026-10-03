@@ -57,6 +57,34 @@ async def test_rejected_command_does_not_publish_fake_on(light):
     assert light._transition_task is None
 
 
+async def test_command_updates_state_after_ack_without_waiting_for_poll(light):
+    started = asyncio.Event()
+    acknowledge = asyncio.Event()
+
+    async def control(payload):
+        started.set()
+        await acknowledge.wait()
+        return True
+
+    light._tcp_client.control.side_effect = control
+    light._tcp_client.query.reset_mock()
+    command = asyncio.create_task(light.async_turn_on(brightness=50))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert not light.is_on
+        assert light.coordinator.data["1"] == 0
+        acknowledge.set()
+        await command
+        assert light.is_on
+        assert light.brightness == 50
+        light._tcp_client.query.assert_not_awaited()
+        assert light.coordinator.update_interval.total_seconds() == 60
+    finally:
+        if not command.done():
+            command.cancel()
+            await asyncio.gather(command, return_exceptions=True)
+
+
 async def test_rgb_fade_off_keeps_mode(light):
     light.coordinator.async_set_updated_data(
         {"1": 255, "2": 1, "4": 1000, "5": 240, "6": 500}

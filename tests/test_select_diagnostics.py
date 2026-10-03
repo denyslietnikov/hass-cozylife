@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.exceptions import HomeAssistantError
 
-from custom_components.cozylife.const import DOMAIN
 from custom_components.cozylife.coordinator import CozyLifeCoordinator
 from custom_components.cozylife.diagnostics import async_get_config_entry_diagnostics
+from custom_components.cozylife.runtime import CozyLifeRuntimeData
 from custom_components.cozylife.select import CozyLifeSetting
 from custom_components.cozylife.tcp_client import tcp_client
 
@@ -31,6 +31,13 @@ async def test_setting_ack_and_no_setup_write(hass, entry):
     await coordinator.async_shutdown()
 
 
+async def test_diagnostics_for_unloaded_entry(hass, entry):
+    result = await async_get_config_entry_diagnostics(hass, entry)
+    assert result["devices"][0]["connected"] is False
+    assert result["devices"][0]["state"] is None
+    assert result["devices"][0]["metadata"]["did"] == "**REDACTED**"
+
+
 async def test_diagnostics_redact_identifiers_without_network(hass, entry):
     client = tcp_client("192.168.88.18")
     client._device_id = "switch_77f8"
@@ -38,12 +45,11 @@ async def test_diagnostics_redact_identifiers_without_network(hass, entry):
     client.control = AsyncMock()
     coordinator = CozyLifeCoordinator(hass, entry, client, 5)
     coordinator.async_set_updated_data({"1": 2})
-    hass.data[DOMAIN] = {
-        entry.entry_id: {
-            "clients": {client.device_id: client},
-            "coordinators": {client.device_id: coordinator},
-        }
-    }
+    entry.runtime_data = CozyLifeRuntimeData(
+        clients={client.device_id: client},
+        coordinators={client.device_id: coordinator},
+        devices=entry.data["devices"],
+    )
     result = await async_get_config_entry_diagnostics(hass, entry)
     assert result["devices"][0]["metadata"]["did"] == "**REDACTED**"
     assert result["devices"][0]["metadata"]["ip"] == "**REDACTED**"
