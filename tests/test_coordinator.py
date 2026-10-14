@@ -139,3 +139,166 @@ async def test_repeated_failures_back_off_but_explicit_command_retries(
     clock.monotonic.return_value = 110
     await coordinator.async_refresh()
     assert coordinator.last_update_success
+
+
+def queue_light_off_recovery(coordinator):
+    coordinator.client._device_type_code = "01"
+    coordinator.client.last_error = "TimeoutError"
+    assert coordinator.async_queue_light_off_recovery()
+
+
+async def test_pending_light_off_reads_before_sending_only_power_off(coordinator):
+    queue_light_off_recovery(coordinator)
+    calls = []
+
+    async def query():
+        calls.append("query")
+        return {"1": 1, "4": 0, "13": 45}
+
+    async def control(payload):
+        calls.append(payload)
+        return True
+
+    coordinator.client.query.side_effect = query
+    coordinator.client.control.side_effect = control
+    await coordinator.async_refresh()
+    assert calls == ["query", {"1": 0}]
+    assert coordinator.data == {"1": 0, "4": 0, "13": 45}
+    assert coordinator.last_update_success
+    assert not coordinator.light_off_recovery_pending
+
+
+async def test_pending_light_off_already_applied_is_not_replayed(coordinator):
+    queue_light_off_recovery(coordinator)
+    coordinator.client.query.return_value = {"1": 0, "4": 0}
+    await coordinator.async_refresh()
+    coordinator.client.control.assert_not_awaited()
+    assert coordinator.data == {"1": 0, "4": 0}
+    assert not coordinator.light_off_recovery_pending
+
+
+async def test_unreachable_light_keeps_pending_off_without_fake_success(coordinator):
+    queue_light_off_recovery(coordinator)
+    coordinator.client.query.return_value = None
+    await coordinator.async_refresh()
+    assert coordinator.data == {"1": 2}
+    assert not coordinator.last_update_success
+    assert coordinator.light_off_recovery_pending
+    coordinator.client.control.assert_not_awaited()
+    coordinator.client.query.return_value = {"1": 1, "4": 0}
+    await coordinator.async_refresh()
+    assert coordinator.data["1"] == 0
+    assert not coordinator.light_off_recovery_pending
+
+
+async def test_recovery_off_ack_timeout_is_reconciled_by_next_read(coordinator):
+    queue_light_off_recovery(coordinator)
+    coordinator.client.query.return_value = {"1": 1, "4": 0}
+    coordinator.client.control.return_value = False
+    await coordinator.async_refresh()
+    assert coordinator.light_off_recovery_pending
+    assert not coordinator.last_update_success
+    assert coordinator.data == {"1": 2}
+    coordinator.client.query.return_value = {"1": 0, "4": 0}
+    await coordinator.async_refresh()
+    coordinator.client.control.assert_awaited_once_with({"1": 0})
+    assert coordinator.last_update_success
+    assert coordinator.data["1"] == 0
+    assert not coordinator.light_off_recovery_pending
+
+
+@pytest.mark.parametrize(
+    "error", ["Device rejected command", "Device identity mismatch", None]
+)
+async def test_protocol_failure_does_not_queue_recovery(coordinator, error):
+    coordinator.client._device_type_code = "01"
+    coordinator.client.last_error = error
+    assert not coordinator.async_queue_light_off_recovery()
+    assert not coordinator.light_off_recovery_pending
+
+
+async def test_pending_recovery_stops_on_rejected_off(coordinator):
+    queue_light_off_recovery(coordinator)
+    coordinator.client.query.return_value = {"1": 1, "4": 0}
+
+    async def reject(payload):
+        coordinator.client.last_error = "Device rejected command"
+        return False
+
+    coordinator.client.control.side_effect = reject
+    await coordinator.async_refresh()
+    assert not coordinator.last_update_success
+    assert not coordinator.light_off_recovery_pending
+    await coordinator.async_refresh()
+    assert coordinator.data["1"] == 1
+    coordinator.client.control.assert_awaited_once_with({"1": 0})
+
+
+async def test_expired_pending_light_off_never_writes(coordinator, mocker):
+    clock = mocker.patch("custom_components.cozylife.coordinator.time")
+    clock.monotonic.return_value = 100
+    queue_light_off_recovery(coordinator)
+    clock.monotonic.return_value = 400
+    await coordinator.async_refresh()
+    coordinator.client.control.assert_not_awaited()
+    assert coordinator.data["1"] == 2
+    assert not coordinator.light_off_recovery_pending
+
+
+async def test_pending_recovery_is_not_copied_to_a_new_coordinator(
+    coordinator, hass, entry
+):
+    queue_light_off_recovery(coordinator)
+    reloaded = CozyLifeCoordinator(hass, entry, coordinator.client, 60)
+    try:
+        assert not reloaded.light_off_recovery_pending
+        await reloaded.async_refresh()
+        coordinator.client.control.assert_not_awaited()
+    finally:
+        await reloaded.async_shutdown()
+
+
+async def test_new_command_cancels_recovery_while_query_in_flight(coordinator):
+    queue_light_off_recovery(coordinator)
+    querying = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def query():
+        querying.set()
+        await resume.wait()
+        return {"1": 1, "4": 400}
+
+    coordinator.client.query.side_effect = query
+    poll = asyncio.create_task(coordinator.async_refresh())
+    await querying.wait()
+    coordinator.async_cancel_light_off_recovery()
+    resume.set()
+    await poll
+    coordinator.client.control.assert_not_awaited()
+    assert coordinator.data["1"] == 1
+
+
+async def test_recovery_does_not_hold_up_other_devices(coordinator, hass, entry):
+    queue_light_off_recovery(coordinator)
+    querying = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def query():
+        querying.set()
+        await resume.wait()
+        return {"1": 1, "4": 0}
+
+    coordinator.client.query.side_effect = query
+    other_client = tcp_client("192.168.88.27")
+    other_client._device_id = "other"
+    other_client.query = AsyncMock(return_value={"1": 0})
+    other = CozyLifeCoordinator(hass, entry, other_client, 5)
+    poll = asyncio.create_task(coordinator.async_refresh())
+    try:
+        await querying.wait()
+        await asyncio.wait_for(other.async_refresh(), timeout=0.3)
+        assert other.data == {"1": 0}
+    finally:
+        resume.set()
+        await poll
+        await other.async_shutdown()

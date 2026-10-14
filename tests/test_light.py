@@ -23,6 +23,7 @@ async def light(hass, entry):
     client._device_id = "131976607c2c67d1c8dc"
     client._dpid = [1, 2, 4, 5, 6, 7, 8]
     client._pid = "o0mmpn"
+    client._device_type_code = "01"
     client.query = AsyncMock(return_value={"1": 0, "2": 1, "4": 1000, "5": 0, "6": 0})
     client.control = AsyncMock(return_value=True)
     coordinator = CozyLifeCoordinator(hass, entry, client, 60)
@@ -296,3 +297,156 @@ async def test_natural_effect_does_not_undo_physical_off(light):
     await light._async_natural_update(None)
     assert not light.is_on
     light._tcp_client.control.assert_not_awaited()
+
+
+@pytest.mark.parametrize("native_brightness", [0, 8])
+async def test_failed_fade_off_recovers_without_replaying_frames(
+    light, native_brightness
+):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 12})
+    light._apply_state(light.coordinator.data)
+    light._tcp_client.query.return_value = {"1": 1, "2": 1, "4": native_brightness}
+
+    async def control(payload):
+        if payload != {"1": 0}:
+            light._tcp_client.last_error = "TimeoutError"
+            return False
+        light._tcp_client.last_error = None
+        return True
+
+    light._tcp_client.control.side_effect = control
+    await light.async_turn_off(transition=0.01)
+    assert [call.args[0] for call in light._tcp_client.control.await_args_list] == [
+        {"1": 255, "4": 12, "2": 1},
+        {"1": 0},
+    ]
+    assert not light.is_on
+    assert light.available
+    assert not light.coordinator.light_off_recovery_pending
+    assert light.extra_state_attributes["last_brightness"] == 12
+    assert light.coordinator.data["4"] == native_brightness
+    light._tcp_client.query.return_value = dict(light.coordinator.data)
+    await light.coordinator.async_refresh()
+    light._apply_state(light.coordinator.data)
+    assert light.extra_state_attributes["last_brightness"] == 12
+    light._tcp_client.control.side_effect = None
+    await light.async_turn_on(transition=0)
+    light._tcp_client.control.assert_awaited_with({"1": 255, "2": 1, "4": 12})
+
+
+async def test_failed_fade_off_stays_pending_until_poll_recovers(light):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 12})
+    light._apply_state(light.coordinator.data)
+    light._tcp_client.control.return_value = False
+    light._tcp_client.last_error = "TimeoutError"
+    light._tcp_client.query.return_value = None
+    with pytest.raises(HomeAssistantError, match="TimeoutError"):
+        await light.async_turn_off(transition=0.01)
+    assert light.coordinator.light_off_recovery_pending
+    assert not light.available
+    assert light.coordinator.data["1"] == 255
+    light._tcp_client.query.return_value = {"1": 1, "2": 1, "4": 0}
+    light._tcp_client.control.return_value = True
+    await light.coordinator.async_refresh()
+    light._apply_state(light.coordinator.data)
+    assert not light.is_on
+    assert light.available
+    light._tcp_client.control.assert_awaited_with({"1": 0})
+
+
+async def test_turn_on_cancels_a_deferred_fade_off(light):
+    light._tcp_client.last_error = "TimeoutError"
+    assert light.coordinator.async_queue_light_off_recovery()
+    await light.async_turn_on(brightness=100)
+    assert not light.coordinator.light_off_recovery_pending
+    light._tcp_client.control.reset_mock()
+    light._tcp_client.query.return_value = dict(light.coordinator.data)
+    await light.coordinator.async_refresh()
+    light._tcp_client.control.assert_not_awaited()
+    assert light.coordinator.data["1"] == 255
+
+
+async def test_new_turn_on_cancels_fade_off_during_immediate_recovery(light):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 12})
+    light._apply_state(light.coordinator.data)
+    querying = asyncio.Event()
+
+    async def query():
+        querying.set()
+        await asyncio.Event().wait()
+
+    async def control(payload):
+        if "4" in payload and payload["4"] == 12:
+            light._tcp_client.last_error = "TimeoutError"
+            return False
+        return True
+
+    light._tcp_client.query.side_effect = query
+    light._tcp_client.control.side_effect = control
+    off = asyncio.create_task(light.async_turn_off(transition=0.01))
+    await asyncio.wait_for(querying.wait(), timeout=1)
+    await asyncio.wait_for(light.async_turn_on(brightness=200, transition=0), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await off
+    assert not light.coordinator.light_off_recovery_pending
+    assert light.is_on
+    assert light.brightness == 200
+    assert all(
+        call.args[0] != {"1": 0} for call in light._tcp_client.control.await_args_list
+    )
+
+
+async def test_fade_in_transport_error_never_queues_power_off(light):
+    light._tcp_client.control.return_value = False
+    light._tcp_client.last_error = "TimeoutError"
+    light._tcp_client.query.reset_mock()
+    with pytest.raises(HomeAssistantError):
+        await light.async_turn_on(brightness=100, transition=0.01)
+    assert not light.coordinator.light_off_recovery_pending
+    light._tcp_client.query.assert_not_awaited()
+
+
+async def test_unloading_cancels_fade_off_recovery(light):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 12})
+    light._apply_state(light.coordinator.data)
+    querying = asyncio.Event()
+
+    async def query():
+        querying.set()
+        await asyncio.Event().wait()
+
+    light._tcp_client.control.return_value = False
+    light._tcp_client.last_error = "TimeoutError"
+    light._tcp_client.query.side_effect = query
+    off = asyncio.create_task(light.async_turn_off(transition=0.01))
+    await asyncio.wait_for(querying.wait(), timeout=1)
+    await light.async_will_remove_from_hass()
+    with pytest.raises(asyncio.CancelledError):
+        await off
+    assert light._transition_task is None
+    assert light._transitioning == 0
+    assert not light.coordinator.light_off_recovery_pending
+
+
+async def test_recovered_off_preserves_pre_fade_brightness_across_reload(light, mocker):
+    light.coordinator.async_set_updated_data({"1": 0, "2": 1, "4": 8})
+    light._apply_state(light.coordinator.data)
+    mocker.patch.object(CozyLifeSwitchAsLight, "async_added_to_hass")
+    mocker.patch.object(
+        light,
+        "async_get_last_state",
+        return_value=State(
+            "light.strip",
+            "off",
+            {"last_brightness": 12, "preserve_off_brightness": True},
+        ),
+    )
+    mocker.patch(
+        "custom_components.cozylife.light.async_track_time_interval",
+        return_value=lambda: None,
+    )
+    await light.async_added_to_hass()
+    assert light.extra_state_attributes["last_brightness"] == 12
+    light._tcp_client.control.assert_not_awaited()
+    await light.async_turn_on(transition=0)
+    light._tcp_client.control.assert_awaited_once_with({"1": 255, "2": 1, "4": 12})

@@ -26,6 +26,9 @@ async def async_get_config_entry_diagnostics(hass, entry: CozyLifeConfigEntry):
                 "last_update_success": (
                     coordinator.last_update_success if coordinator else False
                 ),
+                "light_off_recovery_pending": (
+                    coordinator.light_off_recovery_pending if coordinator else False
+                ),
                 "poll_interval": (
                     coordinator.update_interval.total_seconds() if coordinator else None
                 ),

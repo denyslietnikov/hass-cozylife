@@ -85,6 +85,15 @@ These are software brightness transitions, not a Countdown setting. Network
 latency and the controller's brightness resolution can affect smoothness,
 particularly at very low brightness. Physical power cuts cannot be faded.
 
+If a connection failure interrupts a fade-out, the integration requests a fresh
+state read and completes the power-off without replaying brightness frames. If
+the read confirms the light is already off, no further write is sent. While the
+device is unreachable, the request can be completed by the shared poller for up
+to 5 minutes. A new HA power command cancels it; it is never saved or replayed
+after an integration reload or restart. Rejected commands and identity errors
+are not automatically retried. State is not reported as off without a device
+acknowledgement or a successful state read.
+
 ### Native Light Countdown
 
 Lights advertising DPID 13 get a disabled-by-default **Countdown** number entity.

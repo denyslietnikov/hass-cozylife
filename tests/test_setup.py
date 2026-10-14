@@ -261,6 +261,79 @@ async def test_default_light_fade_toggle_and_options_reload(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.parametrize("lost_ack", ["fade_frame", "final_off"])
+async def test_fade_off_recovers_lost_tcp_ack_without_blind_replay(
+    hass, entry, mock_device, mocker, lost_ack
+):
+    device, host, port = mock_device
+    device.state.update({"1": 1, "2": 1, "4": 12})
+    device.device_info.update(pid="o0mmpn", dtp="01")
+    metadata = {
+        "ip": host,
+        "did": device.device_info["did"],
+        "pid": "o0mmpn",
+        "dmn": "Smart led Strip",
+        "device_type_code": "01",
+        "dpid": [1, 2, 4, 5, 6],
+        "default_transition": 0.01,
+    }
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "devices": [metadata]}
+    )
+    client = tcp_client(host, timeout=0.1)
+    client._port = port
+    mocker.patch("custom_components.cozylife.tcp_client", return_value=client)
+    register_integration(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = entry.runtime_data.coordinators[client.device_id]
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "light", DOMAIN, client.device_id
+    )
+    assert entity_id
+    original_process = device.process_request
+    ack_dropped = False
+
+    async def apply_command_but_lose_ack(request):
+        nonlocal ack_dropped
+        response = await original_process(request)
+        if request["cmd"] == 3 and not ack_dropped:
+            payload = request["msg"]["data"]
+            if (lost_ack == "fade_frame" and payload.get("4") == 0) or (
+                lost_ack == "final_off" and payload == {"1": 0}
+            ):
+                ack_dropped = True
+                return {}
+        return response
+
+    mocker.patch.object(
+        device, "process_request", side_effect=apply_command_but_lose_ack
+    )
+    device.requests.clear()
+    try:
+        await hass.services.async_call(
+            "light", "turn_off", {"entity_id": entity_id}, blocking=True
+        )
+        assert ack_dropped
+        assert device.state["1"] == 0
+        assert device.state["4"] == 0
+        assert hass.states.get(entity_id).state == "off"
+        assert hass.states.get(entity_id).attributes["last_brightness"] == 12
+        assert coordinator.last_update_success
+        assert not coordinator.light_off_recovery_pending
+        writes = [
+            request["msg"]["data"] for request in device.requests if request["cmd"] == 3
+        ]
+        assert writes.count({"1": 0}) == 1
+        assert len([payload for payload in writes if payload.get("4") == 0]) == 1
+        commands = [request["cmd"] for request in device.requests]
+        assert 0 in commands and 2 in commands
+        assert all("13" not in payload for payload in writes)
+        assert client.available
+    finally:
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_native_countdown_service_and_reload(
     hass, entry, mock_device, mocker, enabled

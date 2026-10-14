@@ -265,6 +265,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._command_lock = asyncio.Lock()
         self._effect = "manual"
         self._last_brightness = 1000
+        self._preserve_off_brightness = False
         self._cl = None
         self._max_brightness = 255
         self._min_brightness = 1
@@ -322,6 +323,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         return {
             "last_effect": self._effect,
             "last_brightness": self._last_brightness,
+            "preserve_off_brightness": self._preserve_off_brightness,
             "transitioning": self._transitioning,
         }
 
@@ -369,7 +371,14 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         last_state = await self.async_get_last_state()
         if last_state and last_state.attributes.get("last_effect") in self.effect_list:
             self._effect = last_state.attributes["last_effect"]
-        if last_state and not (self.coordinator.data or {}).get("4"):
+        state = self.coordinator.data or {}
+        if (
+            last_state
+            and state.get("1") == 0
+            and last_state.attributes.get("preserve_off_brightness") is True
+        ):
+            self._preserve_off_brightness = True
+        if last_state and (not state.get("4") or self._preserve_off_brightness):
             brightness = last_state.attributes.get("last_brightness")
             if type(brightness) is int and 1 <= brightness <= 1000:
                 self._last_brightness = brightness
@@ -402,6 +411,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 _LOGGER.debug("Could not update the natural effect", exc_info=True)
 
     async def async_will_remove_from_hass(self) -> None:
+        self.coordinator.async_cancel_light_off_recovery()
         if (
             self._transition_task
             and self._transition_task is not asyncio.current_task()
@@ -424,8 +434,10 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 not self._transition_task
                 and type(state["4"]) is int
                 and 1 <= state["4"] <= 1000
+                and (not self._preserve_off_brightness or state.get("1"))
             ):
                 self._last_brightness = state["4"]
+                self._preserve_off_brightness = False
         if (
             state.get("2", 0) == 0
             and ColorMode.COLOR_TEMP in self.supported_color_modes
@@ -453,6 +465,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Build a target without changing HA state before acknowledgement."""
+        self.coordinator.async_cancel_light_off_recovery()
         dpids = _dpid_set(self._tcp_client)
         payload = {"1": 255}
         if "2" in dpids:
@@ -511,7 +524,10 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         if (
             BRIGHT in dpids
             and "4" not in payload
-            and ((transition and not state.get("1")) or state.get("4") == 0)
+            and (
+                ((transition or self._preserve_off_brightness) and not state.get("1"))
+                or state.get("4") == 0
+            )
         ):
             payload["4"] = self._last_brightness
         await self._async_run_command(payload, transition, effect)
@@ -536,6 +552,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     if task.cancelling():
                         raise
             async with self._command_lock:
+                if turn_off:
+                    self._preserve_off_brightness = True
                 self._transitioning = max(0, transition or 0)
                 state = dict(self.coordinator.data or {})
                 if not state.get("1") and "4" in payload:
@@ -568,11 +586,28 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 await self.coordinator.async_control(payload)
                 if turn_off:
                     await self.coordinator.async_control({"1": 0})
-                elif type(payload.get("4")) is int and 1 <= payload["4"] <= 1000:
-                    self._last_brightness = payload["4"]
+                elif payload.get("1"):
+                    self._preserve_off_brightness = False
+                    if type(payload.get("4")) is int and 1 <= payload["4"] <= 1000:
+                        self._last_brightness = payload["4"]
                 if effect is not None:
                     self._effect = effect
                 self._apply_state(self.coordinator.data)
+        except HomeAssistantError:
+            if (
+                turn_off
+                and self._transition_task is task
+                and self.coordinator.async_queue_light_off_recovery()
+            ):
+                await self.coordinator.async_request_refresh()
+                if (
+                    self.coordinator.last_update_success
+                    and not self.coordinator.light_off_recovery_pending
+                    and (self.coordinator.data or {}).get("1") == 0
+                ):
+                    self._apply_state(self.coordinator.data)
+                    return
+            raise
         finally:
             if self._transition_task is task:
                 self._transition_task = None
@@ -582,6 +617,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Fade brightness in the current color mode before switching off."""
+        self.coordinator.async_cancel_light_off_recovery()
         transition = kwargs.get(ATTR_TRANSITION, self._default_transition)
         if (
             transition
