@@ -224,8 +224,8 @@ class CozyLifeSwitchAsLight(CoordinatorEntity[CozyLifeCoordinator], LightEntity)
 
     def _apply_state(self, state: dict | None) -> None:
         self._state = state
-        if self._state:
-            self._attr_is_on = self._state.get("1", 0) > 0
+        power = (state or {}).get("1")
+        self._attr_is_on = power > 0 if type(power) is int else None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
@@ -262,6 +262,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         if not {"7", "8"} <= _dpid_set(tcp_client):
             self._scenes = [scene for scene in scenes if scene != "chrismas"]
         self._transition_task = None
+        self._unloaded = False
         self._command_lock = asyncio.Lock()
         self._effect = "manual"
         self._last_brightness = 1000
@@ -270,7 +271,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         self._max_brightness = 255
         self._min_brightness = 1
         self._transitioning = 0
-        self._attr_is_on = False
+        self._attr_is_on = None
         self._attr_brightness = 0
         self._attr_hs_color = (0, 0)
         self._attr_min_color_temp_kelvin = DEFAULT_MIN_KELVIN
@@ -367,6 +368,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         """Restore effect and fetch initial state."""
+        self._unloaded = False
         await super().async_added_to_hass()
         last_state = await self.async_get_last_state()
         if last_state and last_state.attributes.get("last_effect") in self.effect_list:
@@ -374,7 +376,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
         state = self.coordinator.data or {}
         if (
             last_state
-            and state.get("1") == 0
+            and state.get("1") in (None, 0)
             and last_state.attributes.get("preserve_off_brightness") is True
         ):
             self._preserve_off_brightness = True
@@ -390,6 +392,8 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
 
     async def async_set_effect(self, effect: str) -> None:
         """Set effect, applying it immediately if the light is on."""
+        if self._unloaded:
+            raise HomeAssistantError("CozyLife light has been unloaded")
         if effect not in self.effect_list:
             raise HomeAssistantError("Unsupported CozyLife effect")
         if self._attr_is_on:
@@ -411,6 +415,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                 _LOGGER.debug("Could not update the natural effect", exc_info=True)
 
     async def async_will_remove_from_hass(self) -> None:
+        self._unloaded = True
         self.coordinator.async_cancel_light_off_recovery()
         if (
             self._transition_task
@@ -569,6 +574,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                     loop = asyncio.get_running_loop()
                     start = loop.time()
                     deadline = start + self._transitioning
+                    previous_frame = None
                     while loop.time() < deadline:
                         fraction = min(1, (loop.time() - start) / self._transitioning)
                         frame = {
@@ -578,7 +584,14 @@ class CozyLifeLight(CozyLifeSwitchAsLight, RestoreEntity):
                                 for key, value in fields.items()
                             },
                         }
-                        await self.coordinator.async_control(frame)
+                        # Rounding can leave several frames identical at low levels.
+                        # Resend if a poll observed an external state change, though.
+                        if frame != previous_frame or any(
+                            (self.coordinator.data or {}).get(key) != value
+                            for key, value in frame.items()
+                        ):
+                            await self.coordinator.async_control(frame)
+                            previous_frame = frame
                         await asyncio.sleep(
                             max(0, min(MIN_INTERVAL, deadline - loop.time()))
                         )

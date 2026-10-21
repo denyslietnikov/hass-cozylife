@@ -14,6 +14,7 @@ from custom_components.cozylife.light import (
     CozyLifeLight,
     CozyLifeSwitchAsLight,
 )
+from custom_components.cozylife.number import CozyLifeCountdown
 from custom_components.cozylife.tcp_client import tcp_client
 
 
@@ -450,3 +451,61 @@ async def test_recovered_off_preserves_pre_fade_brightness_across_reload(light, 
     light._tcp_client.control.assert_not_awaited()
     await light.async_turn_on(transition=0)
     light._tcp_client.control.assert_awaited_once_with({"1": 255, "2": 1, "4": 12})
+
+
+@pytest.mark.parametrize("power,expected", [(0, 400), (255, 8)])
+async def test_offline_reload_waits_for_power_before_discarding_saved_brightness(
+    light, mocker, power, expected
+):
+    light.coordinator.data = None
+    light.coordinator.last_update_success = False
+    mocker.patch.object(CozyLifeSwitchAsLight, "async_added_to_hass")
+    mocker.patch.object(
+        light,
+        "async_get_last_state",
+        return_value=State(
+            "light.strip",
+            "off",
+            {
+                "last_brightness": 400,
+                "preserve_off_brightness": True,
+            },
+        ),
+    )
+    mocker.patch(
+        "custom_components.cozylife.light.async_track_time_interval",
+        return_value=lambda: None,
+    )
+    await light.async_added_to_hass()
+    light._tcp_client.query.return_value = {"1": power, "2": 1, "4": 8}
+    await light.coordinator.async_refresh()
+    light._apply_state(light.coordinator.data)
+    await light.async_turn_on(transition=0)
+    assert light.coordinator.data["4"] == expected
+
+
+async def test_countdown_ack_does_not_invent_power_after_failed_startup(light):
+    light.coordinator.data = None
+    light.coordinator.last_update_success = False
+    countdown = CozyLifeCountdown(light.coordinator)
+    await countdown.async_set_native_value(60)
+    light._apply_state(light.coordinator.data)
+    assert countdown.native_value == 60
+    assert light.is_on is None
+    light._tcp_client.query.return_value = {"1": 255, "4": 400, "13": 59}
+    await light.coordinator.async_refresh()
+    light._apply_state(light.coordinator.data)
+    assert light.is_on is True
+
+
+async def test_low_brightness_fade_skips_repeated_intermediate_frames(light):
+    light.coordinator.async_set_updated_data({"1": 255, "2": 1, "4": 1})
+    light._apply_state(light.coordinator.data)
+    await light.async_turn_off(transition=0.65)
+    payloads = [call.args[0] for call in light._tcp_client.control.await_args_list]
+    intermediate = payloads[:-2]
+    assert all(a != b for a, b in zip(intermediate, intermediate[1:]))
+    assert payloads[-2] == {"1": 255, "2": 1, "4": 0}
+    assert payloads[-1] == {"1": 0}
+    assert not light.is_on
+    assert light.extra_state_attributes["last_brightness"] == 1

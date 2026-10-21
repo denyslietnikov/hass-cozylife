@@ -118,6 +118,18 @@ Download integration diagnostics from the hub menu to inspect polling and errors
 Device IDs and IP addresses are redacted. Existing light and rocker `unique_id`
 values are unchanged; updating does not require removing the integration.
 
+The `cozylife.set_all_effect` action applies effects to up to four lights at a
+time. An error on one light does not prevent the others from being processed;
+the action reports failed lights after all attempts finish. A new command to
+one light cancels only that light's active transition. Cancelling the bulk action
+cancels its outstanding commands.
+
+Transitions skip identical rounded intermediate frames to reduce TCP traffic,
+but always send and acknowledge the final target and, for fade-out, the power-off
+command. Saved pre-fade brightness is retained when a device is unavailable at
+startup until a fresh power state is read. An acknowledgement for Countdown alone
+does not turn an unknown light power state into `off`.
+
 ## YAML Migration
 
 Legacy YAML platform configuration is imported into config entries. After the
@@ -126,6 +138,12 @@ Assistant.
 
 For dual-rocker switches, legacy `switches2` entries are imported with two
 rocker entities mapped to the shared bitmask register.
+
+When older per-device entries or duplicate hubs are consolidated, entity and
+device registry ownership is transferred before the old entries are removed.
+User names, entity IDs and disabled entities are retained. Devices merged into
+an already loaded hub become available through an automatic hub reload; merges
+during initial setup are included before setup completes.
 
 ## Development
 
